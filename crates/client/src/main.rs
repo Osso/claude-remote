@@ -1,5 +1,3 @@
-mod connection;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use claude_remote_common::Config;
@@ -153,7 +151,7 @@ async fn main() -> Result<()> {
 }
 
 async fn send_prompt(config: &Config, server_addr: &str, prompt: &str) -> Result<()> {
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     conn.send(&Request::Prompt {
         content: prompt.to_string(),
@@ -195,7 +193,7 @@ async fn send_prompt(config: &Config, server_addr: &str, prompt: &str) -> Result
 
 async fn interactive_mode(config: &Config, server_addr: &str) -> Result<()> {
     println!("Connecting to {}...", server_addr);
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
     println!("Connected. Type your prompts (Ctrl+D to exit).\n");
 
     let stdin = io::stdin();
@@ -273,7 +271,7 @@ fn configure(config: &Config, server: Option<String>) -> Result<()> {
 
 async fn ping(config: &Config, server_addr: &str) -> Result<()> {
     let start = std::time::Instant::now();
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     conn.send(&Request::Ping).await?;
     let response: Response = conn.receive().await?;
@@ -307,7 +305,7 @@ async fn get_file(
     use base64::Engine;
     use std::path::Path;
 
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     // First, stat the file to get its size
     conn.send(&Request::StatFile {
@@ -431,7 +429,7 @@ async fn put_file(
 
     println!("Uploading {} ({} bytes)...", local_path, file_size);
 
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     // Small file: single request
     if file_size <= CHUNK_SIZE {
@@ -513,7 +511,7 @@ async fn put_file(
 }
 
 async fn shutdown(config: &Config, server_addr: &str) -> Result<()> {
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     println!("Requesting server shutdown...");
     conn.send(&Request::Shutdown).await?;
@@ -536,7 +534,7 @@ async fn shutdown(config: &Config, server_addr: &str) -> Result<()> {
 }
 
 async fn update(config: &Config, server_addr: &str, project_dir: &str) -> Result<()> {
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     println!("Starting server update from {}...", project_dir);
     conn.send(&Request::Update {
@@ -569,7 +567,7 @@ async fn update(config: &Config, server_addr: &str, project_dir: &str) -> Result
     // Wait a moment then verify new server is up
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    match connection::Connection::connect(config, server_addr).await {
+    match claude_remote_client::Connection::connect(config, server_addr).await {
         Ok(mut conn) => {
             conn.send(&Request::Ping).await?;
             let response: Response = conn.receive().await?;
@@ -591,7 +589,7 @@ async fn exec(
     command: &str,
     cwd: Option<&str>,
 ) -> Result<()> {
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     conn.send(&Request::Exec {
         command: command.to_string(),
@@ -627,7 +625,7 @@ async fn exec(
 }
 
 async fn status(config: &Config, server_addr: &str) -> Result<()> {
-    let mut conn = connection::Connection::connect(config, server_addr).await?;
+    let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     conn.send(&Request::Status).await?;
 

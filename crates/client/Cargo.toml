@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "claude_remote_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "claude-remote"
 path = "src/main.rs"
