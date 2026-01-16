@@ -265,6 +265,9 @@ async fn ping(config: &Config, server_addr: &str) -> Result<()> {
     Ok(())
 }
 
+// 8MB chunks (leaves room for base64 overhead within 16MB message limit)
+const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
 async fn get_file(
     config: &Config,
     server_addr: &str,
@@ -276,37 +279,108 @@ async fn get_file(
 
     let mut conn = connection::Connection::connect(config, server_addr).await?;
 
-    conn.send(&Request::GetFile {
+    // First, stat the file to get its size
+    conn.send(&Request::StatFile {
         path: remote_path.to_string(),
     })
     .await?;
 
-    let response: Response = conn.receive().await?;
-
-    match response {
-        Response::FileContent { content } => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&content)
-                .context("Failed to decode file content")?;
-
-            let output_path = local_path.unwrap_or_else(|| {
-                Path::new(remote_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("downloaded_file")
-            });
-
-            std::fs::write(output_path, &decoded)
-                .context(format!("Failed to write to {}", output_path))?;
-
-            println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, decoded.len());
-        }
+    let stat_response: Response = conn.receive().await?;
+    let file_size = match stat_response {
+        Response::FileStat { size } => size,
         Response::Error { message } => {
-            eprintln!("Error: {}", message);
+            anyhow::bail!("Failed to stat file: {}", message);
         }
         _ => {
-            eprintln!("Unexpected response");
+            anyhow::bail!("Unexpected response to stat");
         }
+    };
+
+    let output_path = local_path.unwrap_or_else(|| {
+        Path::new(remote_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("downloaded_file")
+    });
+
+    // Small file: single request
+    if file_size <= CHUNK_SIZE {
+        conn.send(&Request::GetFile {
+            path: remote_path.to_string(),
+        })
+        .await?;
+
+        let response: Response = conn.receive().await?;
+
+        match response {
+            Response::FileContent { content } => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&content)
+                    .context("Failed to decode file content")?;
+
+                std::fs::write(output_path, &decoded)
+                    .context(format!("Failed to write to {}", output_path))?;
+
+                println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, decoded.len());
+            }
+            Response::Error { message } => {
+                anyhow::bail!("Error: {}", message);
+            }
+            _ => {
+                anyhow::bail!("Unexpected response");
+            }
+        }
+    } else {
+        // Large file: chunked transfer
+        let mut file = std::fs::File::create(output_path)
+            .context(format!("Failed to create {}", output_path))?;
+
+        let mut offset = 0u64;
+        let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut chunk_num = 0u64;
+
+        while offset < file_size {
+            chunk_num += 1;
+            let length = std::cmp::min(CHUNK_SIZE, file_size - offset);
+
+            eprint!("\rDownloading chunk {}/{} ({:.1}%)...",
+                chunk_num, num_chunks,
+                (offset as f64 / file_size as f64) * 100.0);
+
+            conn.send(&Request::GetFileChunk {
+                path: remote_path.to_string(),
+                offset,
+                length,
+            })
+            .await?;
+
+            let response: Response = conn.receive().await?;
+
+            match response {
+                Response::FileChunk { content } => {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&content)
+                        .context("Failed to decode chunk")?;
+
+                    use std::io::Write;
+                    file.write_all(&decoded)
+                        .context("Failed to write chunk")?;
+
+                    offset += decoded.len() as u64;
+                }
+                Response::Error { message } => {
+                    eprintln!();
+                    anyhow::bail!("Error downloading chunk: {}", message);
+                }
+                _ => {
+                    eprintln!();
+                    anyhow::bail!("Unexpected response");
+                }
+            }
+        }
+
+        eprintln!();
+        println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, file_size);
     }
 
     Ok(())
@@ -319,30 +393,90 @@ async fn put_file(
     remote_path: &str,
 ) -> Result<()> {
     use base64::Engine;
+    use std::io::Read;
 
-    let content = std::fs::read(local_path).context(format!("Failed to read {}", local_path))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+    let metadata = std::fs::metadata(local_path)
+        .context(format!("Failed to stat {}", local_path))?;
+    let file_size = metadata.len();
+
+    println!("Uploading {} ({} bytes)...", local_path, file_size);
 
     let mut conn = connection::Connection::connect(config, server_addr).await?;
 
-    conn.send(&Request::PutFile {
-        path: remote_path.to_string(),
-        content: encoded,
-    })
-    .await?;
+    // Small file: single request
+    if file_size <= CHUNK_SIZE {
+        let content = std::fs::read(local_path).context(format!("Failed to read {}", local_path))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
 
-    let response: Response = conn.receive().await?;
+        conn.send(&Request::PutFile {
+            path: remote_path.to_string(),
+            content: encoded,
+        })
+        .await?;
 
-    match response {
-        Response::FileOk => {
-            println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, content.len());
+        let response: Response = conn.receive().await?;
+
+        match response {
+            Response::FileOk => {
+                println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, content.len());
+            }
+            Response::Error { message } => {
+                anyhow::bail!("Error: {}", message);
+            }
+            _ => {
+                anyhow::bail!("Unexpected response");
+            }
         }
-        Response::Error { message } => {
-            eprintln!("Error: {}", message);
+    } else {
+        // Large file: chunked transfer
+        let mut file = std::fs::File::open(local_path)
+            .context(format!("Failed to open {}", local_path))?;
+
+        let mut offset = 0u64;
+        let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut chunk_num = 0u64;
+
+        while offset < file_size {
+            chunk_num += 1;
+            let length = std::cmp::min(CHUNK_SIZE, file_size - offset) as usize;
+
+            eprint!("\rUploading chunk {}/{} ({:.1}%)...",
+                chunk_num, num_chunks,
+                (offset as f64 / file_size as f64) * 100.0);
+
+            let mut buffer = vec![0u8; length];
+            file.read_exact(&mut buffer)
+                .context("Failed to read chunk")?;
+
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
+
+            conn.send(&Request::PutFileChunk {
+                path: remote_path.to_string(),
+                offset,
+                total_size: file_size,
+                content: encoded,
+            })
+            .await?;
+
+            let response: Response = conn.receive().await?;
+
+            match response {
+                Response::FileOk => {
+                    offset += length as u64;
+                }
+                Response::Error { message } => {
+                    eprintln!();
+                    anyhow::bail!("Error uploading chunk: {}", message);
+                }
+                _ => {
+                    eprintln!();
+                    anyhow::bail!("Unexpected response");
+                }
+            }
         }
-        _ => {
-            eprintln!("Unexpected response");
-        }
+
+        eprintln!();
+        println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, file_size);
     }
 
     Ok(())

@@ -274,6 +274,24 @@ where
                 .await?;
             }
 
+            Request::StatFile { path } => {
+                match tokio::fs::metadata(&path).await {
+                    Ok(meta) => {
+                        wire::write_message(&mut writer, &Response::FileStat { size: meta.len() })
+                            .await?;
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to stat file: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+
             Request::GetFile { path } => {
                 use base64::Engine;
 
@@ -295,6 +313,75 @@ where
                             &mut writer,
                             &Response::Error {
                                 message: format!("Failed to read file: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            Request::GetFileChunk { path, offset, length } => {
+                use base64::Engine;
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+                match tokio::fs::File::open(&path).await {
+                    Ok(mut file) => {
+                        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                            wire::write_message(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!("Failed to seek: {}", e),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        let mut buffer = vec![0u8; length as usize];
+                        match file.read_exact(&mut buffer).await {
+                            Ok(_) => {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
+                                wire::write_message(&mut writer, &Response::FileChunk { content: encoded })
+                                    .await?;
+                            }
+                            Err(e) => {
+                                // Try reading what's available (for last chunk)
+                                let mut buffer = vec![0u8; length as usize];
+                                if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                                    match file.read(&mut buffer).await {
+                                        Ok(n) => {
+                                            buffer.truncate(n);
+                                            let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
+                                            wire::write_message(&mut writer, &Response::FileChunk { content: encoded })
+                                                .await?;
+                                        }
+                                        Err(e) => {
+                                            wire::write_message(
+                                                &mut writer,
+                                                &Response::Error {
+                                                    message: format!("Failed to read chunk: {}", e),
+                                                },
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                } else {
+                                    wire::write_message(
+                                        &mut writer,
+                                        &Response::Error {
+                                            message: format!("Failed to read chunk: {}", e),
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to open file: {}", e),
                             },
                         )
                         .await?;
@@ -337,6 +424,78 @@ where
                         .await?;
                     }
                 }
+            }
+
+            Request::PutFileChunk { path, offset, total_size, content } => {
+                use base64::Engine;
+                use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+                match base64::engine::general_purpose::STANDARD.decode(&content) {
+                    Ok(decoded) => {
+                        // For first chunk (offset 0), create/truncate file
+                        let file_result = if offset == 0 {
+                            tokio::fs::File::create(&path).await
+                        } else {
+                            tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&path)
+                                .await
+                        };
+
+                        match file_result {
+                            Ok(mut file) => {
+                                if offset > 0 {
+                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                                        wire::write_message(
+                                            &mut writer,
+                                            &Response::Error {
+                                                message: format!("Failed to seek: {}", e),
+                                            },
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                }
+
+                                match file.write_all(&decoded).await {
+                                    Ok(()) => {
+                                        wire::write_message(&mut writer, &Response::FileOk).await?;
+                                    }
+                                    Err(e) => {
+                                        wire::write_message(
+                                            &mut writer,
+                                            &Response::Error {
+                                                message: format!("Failed to write chunk: {}", e),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                wire::write_message(
+                                    &mut writer,
+                                    &Response::Error {
+                                        message: format!("Failed to open file: {}", e),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Invalid base64: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+
+                // Log on last chunk
+                let _ = total_size; // suppress unused warning, used for potential future progress
             }
         }
     }

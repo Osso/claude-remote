@@ -31,17 +31,45 @@ pub enum Request {
     /// Ping/keepalive
     Ping,
 
-    /// Get a file from the server
+    /// Get file metadata (size)
+    StatFile {
+        /// Path to the file
+        path: String,
+    },
+
+    /// Get a file from the server (for small files < 10MB)
     GetFile {
         /// Path to the file on the server
         path: String,
     },
 
-    /// Put a file to the server
+    /// Get a chunk of a file (for large files)
+    GetFileChunk {
+        /// Path to the file on the server
+        path: String,
+        /// Offset in bytes
+        offset: u64,
+        /// Length to read
+        length: u64,
+    },
+
+    /// Put a file to the server (for small files < 10MB)
     PutFile {
         /// Path to save the file on the server
         path: String,
         /// File contents (base64 encoded)
+        content: String,
+    },
+
+    /// Put a chunk of a file (for large files)
+    PutFileChunk {
+        /// Path to save the file on the server
+        path: String,
+        /// Offset in bytes
+        offset: u64,
+        /// Total file size (used for first chunk to create file)
+        total_size: u64,
+        /// Chunk contents (base64 encoded)
         content: String,
     },
 }
@@ -65,8 +93,14 @@ pub enum Response {
     /// Request completed
     Done { session_id: Option<String> },
 
+    /// File metadata
+    FileStat { size: u64 },
+
     /// File content (base64 encoded)
     FileContent { content: String },
+
+    /// File chunk content (base64 encoded)
+    FileChunk { content: String },
 
     /// File operation success
     FileOk,
