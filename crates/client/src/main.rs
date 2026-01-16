@@ -1,6 +1,6 @@
 mod connection;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use claude_remote_common::Config;
 use claude_remote_protocol::{Request, Response};
@@ -45,6 +45,20 @@ enum Commands {
     },
     /// Ping the server
     Ping,
+    /// Download a file from the server
+    Get {
+        /// Remote path on the server
+        remote_path: String,
+        /// Local path to save to (optional, defaults to filename)
+        local_path: Option<String>,
+    },
+    /// Upload a file to the server
+    Put {
+        /// Local path to upload
+        local_path: String,
+        /// Remote path on the server
+        remote_path: String,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +104,18 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Ping) => {
             ping(&config, &server_addr).await?;
+        }
+        Some(Commands::Get {
+            remote_path,
+            local_path,
+        }) => {
+            get_file(&config, &server_addr, &remote_path, local_path.as_deref()).await?;
+        }
+        Some(Commands::Put {
+            local_path,
+            remote_path,
+        }) => {
+            put_file(&config, &server_addr, &local_path, &remote_path).await?;
         }
     }
 
@@ -227,6 +253,89 @@ async fn ping(config: &Config, server_addr: &str) -> Result<()> {
     match response {
         Response::Pong => {
             println!("Pong from {} in {:?}", server_addr, elapsed);
+        }
+        Response::Error { message } => {
+            eprintln!("Error: {}", message);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_file(
+    config: &Config,
+    server_addr: &str,
+    remote_path: &str,
+    local_path: Option<&str>,
+) -> Result<()> {
+    use base64::Engine;
+    use std::path::Path;
+
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    conn.send(&Request::GetFile {
+        path: remote_path.to_string(),
+    })
+    .await?;
+
+    let response: Response = conn.receive().await?;
+
+    match response {
+        Response::FileContent { content } => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&content)
+                .context("Failed to decode file content")?;
+
+            let output_path = local_path.unwrap_or_else(|| {
+                Path::new(remote_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("downloaded_file")
+            });
+
+            std::fs::write(output_path, &decoded)
+                .context(format!("Failed to write to {}", output_path))?;
+
+            println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, decoded.len());
+        }
+        Response::Error { message } => {
+            eprintln!("Error: {}", message);
+        }
+        _ => {
+            eprintln!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+async fn put_file(
+    config: &Config,
+    server_addr: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<()> {
+    use base64::Engine;
+
+    let content = std::fs::read(local_path).context(format!("Failed to read {}", local_path))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    conn.send(&Request::PutFile {
+        path: remote_path.to_string(),
+        content: encoded,
+    })
+    .await?;
+
+    let response: Response = conn.receive().await?;
+
+    match response {
+        Response::FileOk => {
+            println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, content.len());
         }
         Response::Error { message } => {
             eprintln!("Error: {}", message);

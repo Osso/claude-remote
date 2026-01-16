@@ -273,6 +273,55 @@ where
                 )
                 .await?;
             }
+
+            Request::GetFile { path } => {
+                use base64::Engine;
+                match tokio::fs::read(&path).await {
+                    Ok(content) => {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+                        wire::write_message(&mut writer, &Response::FileContent { content: encoded })
+                            .await?;
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to read file: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            Request::PutFile { path, content } => {
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(&content) {
+                    Ok(decoded) => match tokio::fs::write(&path, &decoded).await {
+                        Ok(()) => {
+                            wire::write_message(&mut writer, &Response::FileOk).await?;
+                        }
+                        Err(e) => {
+                            wire::write_message(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!("Failed to write file: {}", e),
+                                },
+                            )
+                            .await?;
+                        }
+                    },
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Invalid base64: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
     }
 

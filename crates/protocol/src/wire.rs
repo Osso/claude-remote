@@ -30,6 +30,20 @@ pub enum Request {
 
     /// Ping/keepalive
     Ping,
+
+    /// Get a file from the server
+    GetFile {
+        /// Path to the file on the server
+        path: String,
+    },
+
+    /// Put a file to the server
+    PutFile {
+        /// Path to save the file on the server
+        path: String,
+        /// File contents (base64 encoded)
+        content: String,
+    },
 }
 
 /// Response from server to client
@@ -50,6 +64,12 @@ pub enum Response {
 
     /// Request completed
     Done { session_id: Option<String> },
+
+    /// File content (base64 encoded)
+    FileContent { content: String },
+
+    /// File operation success
+    FileOk,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
