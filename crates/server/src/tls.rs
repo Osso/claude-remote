@@ -454,8 +454,18 @@ where
             Request::StatFile { path } => {
                 match tokio::fs::metadata(&path).await {
                     Ok(meta) => {
-                        wire::write_message(&mut writer, &Response::FileStat { size: meta.len() })
+                        if meta.is_dir() {
+                            wire::write_message(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!("Path is a directory, not a file: {}", path),
+                                },
+                            )
                             .await?;
+                        } else {
+                            wire::write_message(&mut writer, &Response::FileStat { size: meta.len() })
+                                .await?;
+                        }
                     }
                     Err(e) => {
                         wire::write_message(
@@ -479,6 +489,31 @@ where
                     })
                     .await;
 
+                // Check if path is a directory
+                match tokio::fs::metadata(&path).await {
+                    Ok(meta) if meta.is_dir() => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Path is a directory, not a file: {}", path),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to access path: {}", e),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    _ => {}
+                }
+
                 match tokio::fs::read(&path).await {
                     Ok(content) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
@@ -500,6 +535,31 @@ where
             Request::GetFileChunk { path, offset, length } => {
                 use base64::Engine;
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+                // Check if path is a directory
+                match tokio::fs::metadata(&path).await {
+                    Ok(meta) if meta.is_dir() => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Path is a directory, not a file: {}", path),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to access path: {}", e),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    _ => {}
+                }
 
                 match tokio::fs::File::open(&path).await {
                     Ok(mut file) => {
