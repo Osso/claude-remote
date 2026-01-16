@@ -50,4 +50,8 @@ claude-remote-common = { path = "crates/common" }
 claude-remote-protocol = { path = "crates/protocol" }
 
 # External libs
-tofu-mtls = { path = "../lib/tofu-mtls" }
+tofu-mtls = { git = "https://github.com/Osso/tofu-mtls" }
+
+[profile.release]
+lto = false
+incremental = true

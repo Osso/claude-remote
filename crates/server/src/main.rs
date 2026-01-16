@@ -51,8 +51,11 @@ async fn main() -> Result<()> {
     // Channel for approval requests from connection handlers to GUI
     let (approval_tx, approval_rx) = mpsc::channel::<approval::ApprovalRequest>(16);
 
+    // Channel for activity messages from connection handlers to GUI
+    let (activity_tx, activity_rx) = mpsc::channel::<approval::Activity>(256);
+
     // Start TLS server
-    let server = tls::Server::new(&config, &args.address, args.port, approval_tx).await?;
+    let server = tls::Server::new(&config, &args.address, args.port, approval_tx, activity_tx).await?;
     let server = Arc::new(server);
 
     // Spawn server accept loop
@@ -64,7 +67,7 @@ async fn main() -> Result<()> {
     });
 
     // Run GUI for approval dialogs (blocks main thread)
-    approval::run_gui(approval_rx, config)?;
+    approval::run_gui(approval_rx, activity_rx, config)?;
 
     Ok(())
 }

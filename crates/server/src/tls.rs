@@ -11,7 +11,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tofu_mtls::AcceptAnyClientCert;
 
-use crate::approval::ApprovalRequest;
+use crate::approval::{Activity, ApprovalRequest};
 use crate::claude_process::ClaudeProcess;
 
 pub struct Server {
@@ -19,6 +19,7 @@ pub struct Server {
     acceptor: TlsAcceptor,
     config: Config,
     approval_tx: mpsc::Sender<ApprovalRequest>,
+    activity_tx: mpsc::Sender<Activity>,
 }
 
 impl Server {
@@ -27,6 +28,7 @@ impl Server {
         address: &str,
         port: u16,
         approval_tx: mpsc::Sender<ApprovalRequest>,
+        activity_tx: mpsc::Sender<Activity>,
     ) -> Result<Self> {
         // Load or generate server certificate
         let cert_mgr = CertManager::new(config.config_dir(), "server");
@@ -68,6 +70,7 @@ impl Server {
             acceptor,
             config: Config::with_dir(config.config_dir().to_path_buf()),
             approval_tx,
+            activity_tx,
         })
     }
 
@@ -79,6 +82,7 @@ impl Server {
             let acceptor = self.acceptor.clone();
             let config = Config::with_dir(self.config.config_dir().to_path_buf());
             let approval_tx = self.approval_tx.clone();
+            let activity_tx = self.activity_tx.clone();
 
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
@@ -88,7 +92,7 @@ impl Server {
                         tracing::info!("Client fingerprint: {}", fingerprint);
 
                         if let Err(e) =
-                            handle_connection(tls_stream, fingerprint, config, approval_tx).await
+                            handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx).await
                         {
                             tracing::error!("Connection error: {}", e);
                         }
@@ -121,11 +125,20 @@ async fn handle_connection<S>(
     client_fingerprint: Fingerprint,
     config: Config,
     approval_tx: mpsc::Sender<ApprovalRequest>,
+    activity_tx: mpsc::Sender<Activity>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut reader, mut writer) = split(stream);
+    let fp_str = client_fingerprint.0.clone();
+
+    // Send connected activity
+    let _ = activity_tx
+        .send(Activity::Connected {
+            fingerprint: fp_str.clone(),
+        })
+        .await;
 
     // Check if client is trusted
     let is_trusted = config
@@ -155,6 +168,11 @@ where
                     message: "Connection rejected".to_string(),
                 };
                 wire::write_message(&mut writer, &response).await?;
+                let _ = activity_tx
+                    .send(Activity::Disconnected {
+                        fingerprint: fp_str,
+                    })
+                    .await;
                 return Ok(());
             }
         }
@@ -170,6 +188,12 @@ where
                 tracing::info!("Client disconnected");
                 break;
             }
+            Err(claude_remote_protocol::wire::ProtocolError::Io(e))
+                if e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                tracing::info!("Client disconnected (reset)");
+                break;
+            }
             Err(e) => {
                 tracing::error!("Protocol error: {}", e);
                 break;
@@ -180,6 +204,14 @@ where
             Request::Prompt { content, session_id } => {
                 tracing::info!("Received prompt: {}...", &content[..content.len().min(50)]);
 
+                // Log the prompt
+                let _ = activity_tx
+                    .send(Activity::Prompt {
+                        fingerprint: fp_str.clone(),
+                        content: content.clone(),
+                    })
+                    .await;
+
                 // Spawn Claude process with the prompt
                 match ClaudeProcess::spawn(&content, session_id).await {
                     Ok((process, mut rx)) => {
@@ -189,9 +221,22 @@ where
                         // Stream responses
                         while let Some(output) = rx.recv().await {
                             let is_result = output.is_result();
+
+                            // Log response text
+                            if let Some(text) = output.text() {
+                                if !text.is_empty() && !is_result {
+                                    let _ = activity_tx
+                                        .send(Activity::Response {
+                                            text: text.to_string(),
+                                        })
+                                        .await;
+                                }
+                            }
+
                             let response = Response::Claude { output };
                             wire::write_message(&mut writer, &response).await?;
                             if is_result {
+                                let _ = activity_tx.send(Activity::Completed).await;
                                 break;
                             }
                         }
@@ -230,6 +275,13 @@ where
             }
         }
     }
+
+    // Send disconnected activity
+    let _ = activity_tx
+        .send(Activity::Disconnected {
+            fingerprint: fp_str,
+        })
+        .await;
 
     Ok(())
 }
