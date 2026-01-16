@@ -20,7 +20,16 @@ impl ClaudeProcess {
         content: &str,
         session_id: Option<String>,
     ) -> Result<(Self, mpsc::Receiver<ClaudeOutput>)> {
+        // On Windows, we need to run through cmd.exe to execute .cmd wrappers from npm
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "claude"]);
+            c
+        };
+        #[cfg(not(windows))]
         let mut cmd = Command::new("claude");
+
         cmd.args([
             "-p",
             "--input-format",
