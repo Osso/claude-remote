@@ -274,6 +274,127 @@ where
                 .await?;
             }
 
+            Request::Shutdown => {
+                tracing::info!("Shutdown requested by client");
+                wire::write_message(&mut writer, &Response::ShuttingDown).await?;
+                // Exit the process
+                std::process::exit(0);
+            }
+
+            Request::Update { project_dir } => {
+                use std::process::Command;
+
+                // Helper to send progress
+                async fn send_progress<W: tokio::io::AsyncWrite + Unpin>(
+                    writer: &mut W,
+                    msg: &str,
+                ) -> anyhow::Result<()> {
+                    wire::write_message(writer, &Response::UpdateProgress { message: msg.to_string() }).await?;
+                    Ok(())
+                }
+
+                send_progress(&mut writer, "Pulling latest changes...").await?;
+
+                // Git pull
+                let pull_result = Command::new("git")
+                    .args(["pull"])
+                    .current_dir(&project_dir)
+                    .output();
+
+                match pull_result {
+                    Ok(output) if output.status.success() => {
+                        let msg = String::from_utf8_lossy(&output.stdout);
+                        send_progress(&mut writer, &format!("Git pull: {}", msg.trim())).await?;
+                    }
+                    Ok(output) => {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        wire::write_message(&mut writer, &Response::Error {
+                            message: format!("Git pull failed: {}", err),
+                        }).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        wire::write_message(&mut writer, &Response::Error {
+                            message: format!("Failed to run git: {}", e),
+                        }).await?;
+                        continue;
+                    }
+                }
+
+                send_progress(&mut writer, "Building release...").await?;
+
+                // Cargo build
+                let build_result = Command::new("cargo")
+                    .args(["build", "--release", "-p", "claude-remote-server"])
+                    .current_dir(&project_dir)
+                    .output();
+
+                match build_result {
+                    Ok(output) if output.status.success() => {
+                        send_progress(&mut writer, "Build complete").await?;
+                    }
+                    Ok(output) => {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        wire::write_message(&mut writer, &Response::Error {
+                            message: format!("Build failed: {}", err),
+                        }).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        wire::write_message(&mut writer, &Response::Error {
+                            message: format!("Failed to run cargo: {}", e),
+                        }).await?;
+                        continue;
+                    }
+                }
+
+                // Determine new binary path
+                #[cfg(windows)]
+                let new_binary = format!("{}\\target\\release\\claude-remote-server.exe", project_dir);
+                #[cfg(not(windows))]
+                let new_binary = format!("{}/target/release/claude-remote-server", project_dir);
+
+                // Verify binary exists before attempting restart
+                if !std::path::Path::new(&new_binary).exists() {
+                    wire::write_message(&mut writer, &Response::Error {
+                        message: format!("Binary not found: {}", new_binary),
+                    }).await?;
+                    continue;
+                }
+
+                send_progress(&mut writer, "Starting new server...").await?;
+
+                // Spawn new server (detached)
+                #[cfg(windows)]
+                {
+                    // Use cmd /c start to detach on Windows
+                    let _ = Command::new("cmd")
+                        .args(["/c", "start", "", &new_binary])
+                        .spawn();
+                }
+                #[cfg(not(windows))]
+                {
+                    // Use nohup equivalent on Unix
+                    let _ = Command::new(&new_binary)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+
+                // Give new server time to start
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                wire::write_message(&mut writer, &Response::UpdateComplete {
+                    new_binary: new_binary.clone(),
+                }).await?;
+
+                tracing::info!("Update complete, shutting down old server");
+                // Exit after a brief delay to let response be sent
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                std::process::exit(0);
+            }
+
             Request::StatFile { path } => {
                 match tokio::fs::metadata(&path).await {
                     Ok(meta) => {

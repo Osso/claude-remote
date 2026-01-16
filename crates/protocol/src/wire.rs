@@ -31,6 +31,15 @@ pub enum Request {
     /// Ping/keepalive
     Ping,
 
+    /// Graceful shutdown
+    Shutdown,
+
+    /// Update server: pull, build, restart with new binary
+    Update {
+        /// Path to the project directory
+        project_dir: String,
+    },
+
     /// Get file metadata (size)
     StatFile {
         /// Path to the file
@@ -86,6 +95,15 @@ pub enum Response {
 
     /// Pong response
     Pong,
+
+    /// Shutdown acknowledged - server will exit after sending this
+    ShuttingDown,
+
+    /// Update progress
+    UpdateProgress { message: String },
+
+    /// Update complete - server will restart after sending this
+    UpdateComplete { new_binary: String },
 
     /// Error response
     Error { message: String },

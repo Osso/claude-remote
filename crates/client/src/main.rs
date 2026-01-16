@@ -59,6 +59,14 @@ enum Commands {
         /// Remote path on the server
         remote_path: String,
     },
+    /// Shutdown the server
+    Shutdown,
+    /// Update server (pull, build, restart)
+    Update {
+        /// Project directory on the server
+        #[arg(long, default_value = "C:\\Users\\adeia\\Projects\\claude-remote")]
+        project_dir: String,
+    },
 }
 
 #[tokio::main]
@@ -116,6 +124,12 @@ async fn main() -> Result<()> {
             remote_path,
         }) => {
             put_file(&config, &server_addr, &local_path, &remote_path).await?;
+        }
+        Some(Commands::Shutdown) => {
+            shutdown(&config, &server_addr).await?;
+        }
+        Some(Commands::Update { project_dir }) => {
+            update(&config, &server_addr, &project_dir).await?;
         }
     }
 
@@ -477,6 +491,79 @@ async fn put_file(
 
         eprintln!();
         println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, file_size);
+    }
+
+    Ok(())
+}
+
+async fn shutdown(config: &Config, server_addr: &str) -> Result<()> {
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    println!("Requesting server shutdown...");
+    conn.send(&Request::Shutdown).await?;
+
+    let response: Response = conn.receive().await?;
+
+    match response {
+        Response::ShuttingDown => {
+            println!("Server is shutting down");
+        }
+        Response::Error { message } => {
+            anyhow::bail!("Error: {}", message);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+async fn update(config: &Config, server_addr: &str, project_dir: &str) -> Result<()> {
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    println!("Starting server update from {}...", project_dir);
+    conn.send(&Request::Update {
+        project_dir: project_dir.to_string(),
+    })
+    .await?;
+
+    // Receive progress updates until complete or error
+    loop {
+        let response: Response = conn.receive().await?;
+
+        match response {
+            Response::UpdateProgress { message } => {
+                println!("  {}", message);
+            }
+            Response::UpdateComplete { new_binary } => {
+                println!("Update complete! New binary: {}", new_binary);
+                println!("Server will restart momentarily...");
+                break;
+            }
+            Response::Error { message } => {
+                anyhow::bail!("Update failed: {}", message);
+            }
+            _ => {
+                anyhow::bail!("Unexpected response");
+            }
+        }
+    }
+
+    // Wait a moment then verify new server is up
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    match connection::Connection::connect(config, server_addr).await {
+        Ok(mut conn) => {
+            conn.send(&Request::Ping).await?;
+            let response: Response = conn.receive().await?;
+            if matches!(response, Response::Pong) {
+                println!("New server is running!");
+            }
+        }
+        Err(e) => {
+            println!("Warning: Could not verify new server: {}", e);
+        }
     }
 
     Ok(())
