@@ -31,6 +31,9 @@ pub enum Request {
     /// Ping/keepalive
     Ping,
 
+    /// Get server status (uptime, version)
+    Status,
+
     /// Graceful shutdown
     Shutdown,
 
@@ -38,6 +41,14 @@ pub enum Request {
     Update {
         /// Path to the project directory
         project_dir: String,
+    },
+
+    /// Execute a shell command
+    Exec {
+        /// Command to execute
+        command: String,
+        /// Working directory (optional)
+        cwd: Option<String>,
     },
 
     /// Get file metadata (size)
@@ -96,6 +107,16 @@ pub enum Response {
     /// Pong response
     Pong,
 
+    /// Server status info
+    StatusInfo {
+        /// Uptime in seconds
+        uptime_secs: u64,
+        /// Binary hash (short)
+        version: String,
+        /// Start time (ISO 8601)
+        started_at: String,
+    },
+
     /// Shutdown acknowledged - server will exit after sending this
     ShuttingDown,
 
@@ -104,6 +125,13 @@ pub enum Response {
 
     /// Update complete - server will restart after sending this
     UpdateComplete { new_binary: String },
+
+    /// Command execution result
+    ExecResult {
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
 
     /// Error response
     Error { message: String },

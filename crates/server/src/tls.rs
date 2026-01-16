@@ -13,6 +13,7 @@ use tofu_mtls::AcceptAnyClientCert;
 
 use crate::approval::{Activity, ApprovalRequest};
 use crate::claude_process::ClaudeProcess;
+use crate::ServerInfo;
 
 pub struct Server {
     listener: TcpListener,
@@ -20,6 +21,7 @@ pub struct Server {
     config: Config,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     activity_tx: mpsc::Sender<Activity>,
+    server_info: Arc<ServerInfo>,
 }
 
 impl Server {
@@ -29,6 +31,7 @@ impl Server {
         port: u16,
         approval_tx: mpsc::Sender<ApprovalRequest>,
         activity_tx: mpsc::Sender<Activity>,
+        server_info: Arc<ServerInfo>,
     ) -> Result<Self> {
         // Load or generate server certificate
         let cert_mgr = CertManager::new(config.config_dir(), "server");
@@ -71,6 +74,7 @@ impl Server {
             config: Config::with_dir(config.config_dir().to_path_buf()),
             approval_tx,
             activity_tx,
+            server_info,
         })
     }
 
@@ -83,6 +87,7 @@ impl Server {
             let config = Config::with_dir(self.config.config_dir().to_path_buf());
             let approval_tx = self.approval_tx.clone();
             let activity_tx = self.activity_tx.clone();
+            let server_info = self.server_info.clone();
 
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
@@ -92,7 +97,7 @@ impl Server {
                         tracing::info!("Client fingerprint: {}", fingerprint);
 
                         if let Err(e) =
-                            handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx).await
+                            handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx, server_info).await
                         {
                             tracing::error!("Connection error: {}", e);
                         }
@@ -126,6 +131,7 @@ async fn handle_connection<S>(
     config: Config,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     activity_tx: mpsc::Sender<Activity>,
+    server_info: Arc<ServerInfo>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -263,6 +269,14 @@ where
                 wire::write_message(&mut writer, &Response::Pong).await?;
             }
 
+            Request::Status => {
+                wire::write_message(&mut writer, &Response::StatusInfo {
+                    uptime_secs: server_info.uptime_secs(),
+                    version: server_info.version.clone(),
+                    started_at: server_info.started_at_iso(),
+                }).await?;
+            }
+
             Request::ListSessions => {
                 // TODO: implement session listing
                 wire::write_message(
@@ -393,6 +407,48 @@ where
                 // Exit after a brief delay to let response be sent
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 std::process::exit(0);
+            }
+
+            Request::Exec { command, cwd } => {
+                use std::process::Command;
+
+                tracing::info!("Executing command: {}", command);
+
+                // Use shell to execute command
+                #[cfg(windows)]
+                let result = {
+                    let mut cmd = Command::new("cmd");
+                    cmd.args(["/c", &command]);
+                    if let Some(dir) = &cwd {
+                        cmd.current_dir(dir);
+                    }
+                    cmd.output()
+                };
+
+                #[cfg(not(windows))]
+                let result = {
+                    let mut cmd = Command::new("sh");
+                    cmd.args(["-c", &command]);
+                    if let Some(dir) = &cwd {
+                        cmd.current_dir(dir);
+                    }
+                    cmd.output()
+                };
+
+                match result {
+                    Ok(output) => {
+                        wire::write_message(&mut writer, &Response::ExecResult {
+                            exit_code: output.status.code(),
+                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        }).await?;
+                    }
+                    Err(e) => {
+                        wire::write_message(&mut writer, &Response::Error {
+                            message: format!("Failed to execute command: {}", e),
+                        }).await?;
+                    }
+                }
             }
 
             Request::StatFile { path } => {

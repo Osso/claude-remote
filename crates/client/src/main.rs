@@ -67,6 +67,16 @@ enum Commands {
         #[arg(long, default_value = "C:\\Users\\adeia\\Projects\\claude-remote")]
         project_dir: String,
     },
+    /// Execute a shell command on the server
+    Exec {
+        /// Command to execute
+        command: String,
+        /// Working directory
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// Show server status (uptime, version)
+    Status,
 }
 
 #[tokio::main]
@@ -130,6 +140,12 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Update { project_dir }) => {
             update(&config, &server_addr, &project_dir).await?;
+        }
+        Some(Commands::Exec { command, cwd }) => {
+            exec(&config, &server_addr, &command, cwd.as_deref()).await?;
+        }
+        Some(Commands::Status) => {
+            status(&config, &server_addr).await?;
         }
     }
 
@@ -563,6 +579,76 @@ async fn update(config: &Config, server_addr: &str, project_dir: &str) -> Result
         }
         Err(e) => {
             println!("Warning: Could not verify new server: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn exec(
+    config: &Config,
+    server_addr: &str,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<()> {
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    conn.send(&Request::Exec {
+        command: command.to_string(),
+        cwd: cwd.map(String::from),
+    })
+    .await?;
+
+    let response: Response = conn.receive().await?;
+
+    match response {
+        Response::ExecResult { exit_code, stdout, stderr } => {
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+            if let Some(code) = exit_code {
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+        }
+        Response::Error { message } => {
+            anyhow::bail!("Error: {}", message);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+async fn status(config: &Config, server_addr: &str) -> Result<()> {
+    let mut conn = connection::Connection::connect(config, server_addr).await?;
+
+    conn.send(&Request::Status).await?;
+
+    let response: Response = conn.receive().await?;
+
+    match response {
+        Response::StatusInfo { uptime_secs, version, started_at } => {
+            let hours = uptime_secs / 3600;
+            let mins = (uptime_secs % 3600) / 60;
+            let secs = uptime_secs % 60;
+
+            println!("Server Status:");
+            println!("  Version:    {}", version);
+            println!("  Started at: {} (Unix timestamp)", started_at);
+            println!("  Uptime:     {}h {}m {}s", hours, mins, secs);
+        }
+        Response::Error { message } => {
+            anyhow::bail!("Error: {}", message);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response");
         }
     }
 
