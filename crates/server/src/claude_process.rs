@@ -38,7 +38,9 @@ impl ClaudeProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().context("Failed to spawn claude process")?;
+        let mut child = cmd.spawn().with_context(|| {
+            format!("Failed to spawn claude process. Is 'claude' in PATH?")
+        })?;
 
         let mut stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = child.stdout.take().context("Failed to get stdout")?;
