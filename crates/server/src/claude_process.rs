@@ -37,6 +37,7 @@ impl ClaudeProcess {
             "--output-format",
             "stream-json",
             "--verbose",
+            "--dangerously-skip-permissions",
         ]);
 
         if let Some(id) = session_id {
