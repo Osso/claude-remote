@@ -276,6 +276,14 @@ where
 
             Request::GetFile { path } => {
                 use base64::Engine;
+
+                let _ = activity_tx
+                    .send(Activity::FileGet {
+                        fingerprint: fp_str.clone(),
+                        path: path.clone(),
+                    })
+                    .await;
+
                 match tokio::fs::read(&path).await {
                     Ok(content) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
@@ -296,6 +304,14 @@ where
 
             Request::PutFile { path, content } => {
                 use base64::Engine;
+
+                let _ = activity_tx
+                    .send(Activity::FilePut {
+                        fingerprint: fp_str.clone(),
+                        path: path.clone(),
+                    })
+                    .await;
+
                 match base64::engine::general_purpose::STANDARD.decode(&content) {
                     Ok(decoded) => match tokio::fs::write(&path, &decoded).await {
                         Ok(()) => {

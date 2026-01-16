@@ -25,6 +25,10 @@ pub enum Activity {
     Response { text: String },
     /// Request completed
     Completed,
+    /// File downloaded
+    FileGet { fingerprint: String, path: String },
+    /// File uploaded
+    FilePut { fingerprint: String, path: String },
 }
 
 /// Message type for the approval GUI
@@ -169,6 +173,12 @@ impl ApprovalApp {
                         Activity::Completed => {
                             self.add_log("---", "completed");
                         }
+                        Activity::FileGet { fingerprint, path } => {
+                            self.add_log(format!("[{}]", &fingerprint[..8]), format!("GET {}", path));
+                        }
+                        Activity::FilePut { fingerprint, path } => {
+                            self.add_log(format!("[{}]", &fingerprint[..8]), format!("PUT {}", path));
+                        }
                     }
                 }
 
@@ -207,14 +217,23 @@ impl ApprovalApp {
         };
 
         // Activity log
+        let grey = iced::Color::from_rgb(0.5, 0.5, 0.5);
         let log_entries: Vec<Element<'_, Message>> = self
             .activity_log
             .iter()
             .map(|entry| {
-                row![
-                    text(&entry.prefix).size(20).width(Length::Fixed(140.0)),
-                    text(&entry.content).size(20),
-                ]
+                let is_grey = entry.prefix == "CONNECT" || entry.prefix == "DISCONNECT";
+                if is_grey {
+                    row![
+                        text(&entry.prefix).size(20).width(Length::Fixed(140.0)).color(grey),
+                        text(&entry.content).size(20).color(grey),
+                    ]
+                } else {
+                    row![
+                        text(&entry.prefix).size(20).width(Length::Fixed(140.0)),
+                        text(&entry.content).size(20),
+                    ]
+                }
                 .spacing(12)
                 .into()
             })
