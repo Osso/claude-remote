@@ -78,13 +78,17 @@ impl ServerInfo {
 #[command(name = "claude-remote-server")]
 #[command(about = "Remote control server for Claude Code")]
 struct Args {
-    /// Listen address
+    /// Listen address (ignored if --socket is used)
     #[arg(short, long, default_value = "0.0.0.0")]
     address: String,
 
-    /// Listen port
+    /// Listen port (ignored if --socket is used)
     #[arg(short, long, default_value = "7433")]
     port: u16,
+
+    /// Unix socket path (alternative to address:port)
+    #[arg(long)]
+    socket: Option<String>,
 
     /// Config directory
     #[arg(long)]
@@ -123,7 +127,18 @@ async fn main() -> Result<()> {
     let (activity_tx, activity_rx) = mpsc::channel::<approval::Activity>(256);
 
     // Start TLS server
-    let server = tls::Server::new(&config, &args.address, args.port, approval_tx, activity_tx, server_info).await?;
+    let server = if let Some(socket_path) = &args.socket {
+        #[cfg(unix)]
+        {
+            tls::Server::new_unix(&config, socket_path, approval_tx, activity_tx, server_info).await?
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("Unix sockets are not supported on this platform");
+        }
+    } else {
+        tls::Server::new(&config, &args.address, args.port, approval_tx, activity_tx, server_info).await?
+    };
     let server = Arc::new(server);
 
     // Spawn server accept loop

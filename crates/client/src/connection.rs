@@ -6,16 +6,25 @@ use claude_remote_protocol::wire;
 use rustls::pki_types::ServerName;
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{split, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tofu_mtls::{AcceptAnyServerCert, KnownHosts, TofuVerification};
 
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+/// A boxed async reader
+type BoxedRead = Pin<Box<dyn AsyncRead + Send + Unpin>>;
+/// A boxed async writer
+type BoxedWrite = Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+
 pub struct Connection {
-    reader: ReadHalf<TlsStream<TcpStream>>,
-    writer: WriteHalf<TlsStream<TcpStream>>,
+    reader: BoxedRead,
+    writer: BoxedWrite,
 }
 
 /// Result of server verification
@@ -66,32 +75,21 @@ impl Connection {
         config: &Config,
         server_addr: &str,
     ) -> Result<(Self, ServerVerification)> {
-        // Load or generate client certificate
-        let cert_mgr = CertManager::new(config.config_dir(), "client");
-        let (cert_pem, key_pem) = cert_mgr
-            .load_or_generate("claude-remote-client")
-            .context("Failed to load/generate client certificate")?;
+        // Check if this is a Unix socket path
+        #[cfg(unix)]
+        if is_unix_socket_path(server_addr) {
+            return Self::connect_unix_with_verification(config, server_addr).await;
+        }
 
-        let fingerprint = cert_mgr.fingerprint()?;
-        tracing::info!("Client certificate fingerprint: {}", fingerprint);
+        Self::connect_tcp_with_verification(config, server_addr).await
+    }
 
-        // Parse certificate and key
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse certificate")?;
-
-        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-            .context("Failed to parse private key")?
-            .context("No private key found")?;
-
-        // Build TLS config - accept any cert, we verify fingerprint after handshake
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            .with_client_auth_cert(certs, key)
-            .context("Failed to build TLS config")?;
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
+    /// Connect via TCP
+    async fn connect_tcp_with_verification(
+        config: &Config,
+        server_addr: &str,
+    ) -> Result<(Self, ServerVerification)> {
+        let connector = build_tls_connector(config)?;
 
         // Parse server address
         let (host, port) = parse_address(server_addr)?;
@@ -120,8 +118,51 @@ impl Connection {
         let known_hosts_path = config.config_dir().join("known_servers.toml");
         let verification = verify_server(&known_hosts_path, server_addr, &server_fingerprint)?;
 
-        let (reader, writer) = split(tls_stream);
-        let conn = Self { reader, writer };
+        let (reader, writer) = tokio::io::split(tls_stream);
+        let conn = Self {
+            reader: Box::pin(reader),
+            writer: Box::pin(writer),
+        };
+
+        Ok((conn, verification))
+    }
+
+    /// Connect via Unix socket
+    #[cfg(unix)]
+    async fn connect_unix_with_verification(
+        config: &Config,
+        socket_path: &str,
+    ) -> Result<(Self, ServerVerification)> {
+        let connector = build_tls_connector(config)?;
+
+        tracing::info!("Connecting to Unix socket {}", socket_path);
+
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .context(format!("Failed to connect to Unix socket {}", socket_path))?;
+
+        // Use "localhost" as server name for Unix sockets
+        let server_name = ServerName::try_from("localhost".to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
+
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .context("TLS handshake failed")?;
+
+        // Extract server certificate fingerprint
+        let server_fingerprint = extract_server_fingerprint_generic(&tls_stream);
+        tracing::debug!("Server fingerprint: {}", server_fingerprint);
+
+        // TOFU verification using socket path as identifier
+        let known_hosts_path = config.config_dir().join("known_servers.toml");
+        let verification = verify_server(&known_hosts_path, socket_path, &server_fingerprint)?;
+
+        let (reader, writer) = tokio::io::split(tls_stream);
+        let conn = Self {
+            reader: Box::pin(reader),
+            writer: Box::pin(writer),
+        };
 
         Ok((conn, verification))
     }
@@ -139,6 +180,42 @@ impl Connection {
     }
 }
 
+/// Build TLS connector with client certificate
+fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
+    let cert_mgr = CertManager::new(config.config_dir(), "client");
+    let (cert_pem, key_pem) = cert_mgr
+        .load_or_generate("claude-remote-client")
+        .context("Failed to load/generate client certificate")?;
+
+    let fingerprint = cert_mgr.fingerprint()?;
+    tracing::info!("Client certificate fingerprint: {}", fingerprint);
+
+    // Parse certificate and key
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse certificate")?;
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .context("Failed to parse private key")?
+        .context("No private key found")?;
+
+    // Build TLS config - accept any cert, we verify fingerprint after handshake
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_client_auth_cert(certs, key)
+        .context("Failed to build TLS config")?;
+
+    Ok(TlsConnector::from(Arc::new(tls_config)))
+}
+
+/// Check if the address looks like a Unix socket path
+#[cfg(unix)]
+fn is_unix_socket_path(addr: &str) -> bool {
+    // Unix socket if it starts with / or ./
+    addr.starts_with('/') || addr.starts_with("./")
+}
+
 fn parse_address(addr: &str) -> Result<(&str, u16)> {
     if let Some((host, port_str)) = addr.rsplit_once(':') {
         let port = port_str
@@ -150,8 +227,25 @@ fn parse_address(addr: &str) -> Result<(&str, u16)> {
     }
 }
 
-/// Extract server certificate fingerprint from TLS stream
+/// Extract server certificate fingerprint from TLS stream over TCP
 fn extract_server_fingerprint(stream: &TlsStream<TcpStream>) -> Fingerprint {
+    let (_, client_conn) = stream.get_ref();
+
+    if let Some(certs) = client_conn.peer_certificates() {
+        if let Some(cert) = certs.first() {
+            return Fingerprint::from_rustls_cert(cert);
+        }
+    }
+
+    Fingerprint("no-certificate".to_string())
+}
+
+/// Extract server certificate fingerprint from TLS stream (generic)
+#[cfg(unix)]
+fn extract_server_fingerprint_generic<S>(stream: &TlsStream<S>) -> Fingerprint
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (_, client_conn) = stream.get_ref();
 
     if let Some(certs) = client_conn.peer_certificates() {
@@ -233,6 +327,27 @@ mod tests {
     fn parse_address_port_out_of_range() {
         let result = parse_address("example.com:99999");
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_unix_socket_absolute_path() {
+        assert!(is_unix_socket_path("/tmp/test.sock"));
+        assert!(is_unix_socket_path("/var/run/claude.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_unix_socket_relative_path() {
+        assert!(is_unix_socket_path("./test.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_not_unix_socket() {
+        assert!(!is_unix_socket_path("localhost:7433"));
+        assert!(!is_unix_socket_path("192.168.1.1:7433"));
+        assert!(!is_unix_socket_path("example.com"));
     }
 
     // TOFU verification tests using tofu-mtls

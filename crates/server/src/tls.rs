@@ -5,18 +5,57 @@ use claude_remote_common::{CertManager, Config, Fingerprint};
 use claude_remote_protocol::{wire, Request, Response};
 use std::sync::Arc;
 use tokio::io::{split, AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tofu_mtls::AcceptAnyClientCert;
 
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
 use crate::approval::{Activity, ApprovalRequest};
 use crate::claude_process::ClaudeProcess;
 use crate::ServerInfo;
 
+/// Listener that can be either TCP or Unix socket
+pub enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl Listener {
+    pub async fn bind_tcp(addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .context(format!("Failed to bind to {}", addr))?;
+        Ok(Listener::Tcp(listener))
+    }
+
+    #[cfg(unix)]
+    pub async fn bind_unix(path: &str) -> Result<Self> {
+        // Remove existing socket file if it exists
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path)
+            .context(format!("Failed to bind to Unix socket {}", path))?;
+        Ok(Listener::Unix(listener))
+    }
+
+    #[allow(dead_code)]
+    pub fn local_addr_string(&self) -> String {
+        match self {
+            Listener::Tcp(l) => l.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            #[cfg(unix)]
+            Listener::Unix(l) => l.local_addr()
+                .map(|a| a.as_pathname().map(|p| p.display().to_string()).unwrap_or_default())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 pub struct Server {
-    listener: TcpListener,
+    listener: Listener,
     acceptor: TlsAcceptor,
     config: Config,
     approval_tx: mpsc::Sender<ApprovalRequest>,
@@ -25,10 +64,38 @@ pub struct Server {
 }
 
 impl Server {
+    /// Create a new server listening on TCP
     pub async fn new(
         config: &Config,
         address: &str,
         port: u16,
+        approval_tx: mpsc::Sender<ApprovalRequest>,
+        activity_tx: mpsc::Sender<Activity>,
+        server_info: Arc<ServerInfo>,
+    ) -> Result<Self> {
+        let addr = format!("{}:{}", address, port);
+        let listener = Listener::bind_tcp(&addr).await?;
+        tracing::info!("Listening on {}", addr);
+        Self::with_listener(config, listener, approval_tx, activity_tx, server_info)
+    }
+
+    /// Create a new server listening on a Unix socket
+    #[cfg(unix)]
+    pub async fn new_unix(
+        config: &Config,
+        socket_path: &str,
+        approval_tx: mpsc::Sender<ApprovalRequest>,
+        activity_tx: mpsc::Sender<Activity>,
+        server_info: Arc<ServerInfo>,
+    ) -> Result<Self> {
+        let listener = Listener::bind_unix(socket_path).await?;
+        tracing::info!("Listening on Unix socket {}", socket_path);
+        Self::with_listener(config, listener, approval_tx, activity_tx, server_info)
+    }
+
+    fn with_listener(
+        config: &Config,
+        listener: Listener,
         approval_tx: mpsc::Sender<ApprovalRequest>,
         activity_tx: mpsc::Sender<Activity>,
         server_info: Arc<ServerInfo>,
@@ -60,14 +127,6 @@ impl Server {
 
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-        // Bind to address
-        let addr = format!("{}:{}", address, port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .context(format!("Failed to bind to {}", addr))?;
-
-        tracing::info!("Listening on {}", addr);
-
         Ok(Self {
             listener,
             acceptor,
@@ -80,39 +139,58 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         loop {
-            let (stream, peer_addr) = self.listener.accept().await?;
-            tracing::info!("Connection from {}", peer_addr);
+            match &self.listener {
+                Listener::Tcp(tcp_listener) => {
+                    let (stream, peer_addr) = tcp_listener.accept().await?;
+                    tracing::info!("Connection from {}", peer_addr);
+                    self.handle_stream(stream).await;
+                }
+                #[cfg(unix)]
+                Listener::Unix(unix_listener) => {
+                    let (stream, _) = unix_listener.accept().await?;
+                    tracing::info!("Connection from Unix socket");
+                    self.handle_stream(stream).await;
+                }
+            }
+        }
+    }
 
-            let acceptor = self.acceptor.clone();
-            let config = Config::with_dir(self.config.config_dir().to_path_buf());
-            let approval_tx = self.approval_tx.clone();
-            let activity_tx = self.activity_tx.clone();
-            let server_info = self.server_info.clone();
+    async fn handle_stream<S>(&self, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let acceptor = self.acceptor.clone();
+        let config = Config::with_dir(self.config.config_dir().to_path_buf());
+        let approval_tx = self.approval_tx.clone();
+        let activity_tx = self.activity_tx.clone();
+        let server_info = self.server_info.clone();
 
-            tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        // Extract client certificate fingerprint
-                        let fingerprint = extract_client_fingerprint(&tls_stream);
-                        tracing::info!("Client fingerprint: {}", fingerprint);
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    // Extract client certificate fingerprint
+                    let fingerprint = extract_client_fingerprint_generic(&tls_stream);
+                    tracing::info!("Client fingerprint: {}", fingerprint);
 
-                        if let Err(e) =
-                            handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx, server_info).await
-                        {
-                            tracing::error!("Connection error: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("TLS handshake failed: {}", e);
+                    if let Err(e) =
+                        handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx, server_info).await
+                    {
+                        tracing::error!("Connection error: {}", e);
                     }
                 }
-            });
-        }
+                Err(e) => {
+                    tracing::error!("TLS handshake failed: {}", e);
+                }
+            }
+        });
     }
 }
 
-/// Extract client certificate fingerprint from TLS stream
-fn extract_client_fingerprint(stream: &TlsStream<TcpStream>) -> Fingerprint {
+/// Extract client certificate fingerprint from TLS stream (generic version)
+fn extract_client_fingerprint_generic<S>(stream: &TlsStream<S>) -> Fingerprint
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (_, server_conn) = stream.get_ref();
 
     if let Some(certs) = server_conn.peer_certificates() {
