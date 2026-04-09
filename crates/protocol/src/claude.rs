@@ -11,9 +11,7 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeInput {
     /// User message
-    User {
-        message: UserMessage,
-    },
+    User { message: UserMessage },
     /// Control message (e.g., abort)
     Control {
         #[serde(flatten)]
@@ -118,8 +116,14 @@ pub struct AssistantContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
     #[serde(other)]
     Other,
 }
@@ -253,7 +257,14 @@ mod tests {
         let output: ClaudeOutput = serde_json::from_str(json).unwrap();
         match output {
             ClaudeOutput::System(msg) => {
-                assert_eq!(msg.tools, Some(vec!["Read".to_string(), "Write".to_string(), "Bash".to_string()]));
+                assert_eq!(
+                    msg.tools,
+                    Some(vec![
+                        "Read".to_string(),
+                        "Write".to_string(),
+                        "Bash".to_string()
+                    ])
+                );
             }
             _ => panic!("Expected System message"),
         }
@@ -369,7 +380,8 @@ mod tests {
 
     #[test]
     fn parse_error_message() {
-        let json = r#"{"type":"error","error":"API rate limit exceeded","message":"Please try again"}"#;
+        let json =
+            r#"{"type":"error","error":"API rate limit exceeded","message":"Please try again"}"#;
         let output: ClaudeOutput = serde_json::from_str(json).unwrap();
         assert!(output.is_error());
         match output {

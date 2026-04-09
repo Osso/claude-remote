@@ -349,7 +349,12 @@ async fn get_file(
                 std::fs::write(output_path, &decoded)
                     .context(format!("Failed to write to {}", output_path))?;
 
-                println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, decoded.len());
+                println!(
+                    "Downloaded {} -> {} ({} bytes)",
+                    remote_path,
+                    output_path,
+                    decoded.len()
+                );
             }
             Response::Error { message } => {
                 anyhow::bail!("Error: {}", message);
@@ -371,9 +376,12 @@ async fn get_file(
             chunk_num += 1;
             let length = std::cmp::min(CHUNK_SIZE, file_size - offset);
 
-            eprint!("\rDownloading chunk {}/{} ({:.1}%)...",
-                chunk_num, num_chunks,
-                (offset as f64 / file_size as f64) * 100.0);
+            eprint!(
+                "\rDownloading chunk {}/{} ({:.1}%)...",
+                chunk_num,
+                num_chunks,
+                (offset as f64 / file_size as f64) * 100.0
+            );
 
             conn.send(&Request::GetFileChunk {
                 path: remote_path.to_string(),
@@ -391,8 +399,7 @@ async fn get_file(
                         .context("Failed to decode chunk")?;
 
                     use std::io::Write;
-                    file.write_all(&decoded)
-                        .context("Failed to write chunk")?;
+                    file.write_all(&decoded).context("Failed to write chunk")?;
 
                     offset += decoded.len() as u64;
                 }
@@ -408,7 +415,10 @@ async fn get_file(
         }
 
         eprintln!();
-        println!("Downloaded {} -> {} ({} bytes)", remote_path, output_path, file_size);
+        println!(
+            "Downloaded {} -> {} ({} bytes)",
+            remote_path, output_path, file_size
+        );
     }
 
     Ok(())
@@ -423,8 +433,8 @@ async fn put_file(
     use base64::Engine;
     use std::io::Read;
 
-    let metadata = std::fs::metadata(local_path)
-        .context(format!("Failed to stat {}", local_path))?;
+    let metadata =
+        std::fs::metadata(local_path).context(format!("Failed to stat {}", local_path))?;
     let file_size = metadata.len();
 
     println!("Uploading {} ({} bytes)...", local_path, file_size);
@@ -433,7 +443,8 @@ async fn put_file(
 
     // Small file: single request
     if file_size <= CHUNK_SIZE {
-        let content = std::fs::read(local_path).context(format!("Failed to read {}", local_path))?;
+        let content =
+            std::fs::read(local_path).context(format!("Failed to read {}", local_path))?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
 
         conn.send(&Request::PutFile {
@@ -446,7 +457,12 @@ async fn put_file(
 
         match response {
             Response::FileOk => {
-                println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, content.len());
+                println!(
+                    "Uploaded {} -> {} ({} bytes)",
+                    local_path,
+                    remote_path,
+                    content.len()
+                );
             }
             Response::Error { message } => {
                 anyhow::bail!("Error: {}", message);
@@ -457,8 +473,8 @@ async fn put_file(
         }
     } else {
         // Large file: chunked transfer
-        let mut file = std::fs::File::open(local_path)
-            .context(format!("Failed to open {}", local_path))?;
+        let mut file =
+            std::fs::File::open(local_path).context(format!("Failed to open {}", local_path))?;
 
         let mut offset = 0u64;
         let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -468,9 +484,12 @@ async fn put_file(
             chunk_num += 1;
             let length = std::cmp::min(CHUNK_SIZE, file_size - offset) as usize;
 
-            eprint!("\rUploading chunk {}/{} ({:.1}%)...",
-                chunk_num, num_chunks,
-                (offset as f64 / file_size as f64) * 100.0);
+            eprint!(
+                "\rUploading chunk {}/{} ({:.1}%)...",
+                chunk_num,
+                num_chunks,
+                (offset as f64 / file_size as f64) * 100.0
+            );
 
             let mut buffer = vec![0u8; length];
             file.read_exact(&mut buffer)
@@ -504,7 +523,10 @@ async fn put_file(
         }
 
         eprintln!();
-        println!("Uploaded {} -> {} ({} bytes)", local_path, remote_path, file_size);
+        println!(
+            "Uploaded {} -> {} ({} bytes)",
+            local_path, remote_path, file_size
+        );
     }
 
     Ok(())
@@ -583,12 +605,7 @@ async fn update(config: &Config, server_addr: &str, project_dir: &str) -> Result
     Ok(())
 }
 
-async fn exec(
-    config: &Config,
-    server_addr: &str,
-    command: &str,
-    cwd: Option<&str>,
-) -> Result<()> {
+async fn exec(config: &Config, server_addr: &str, command: &str, cwd: Option<&str>) -> Result<()> {
     let mut conn = claude_remote_client::Connection::connect(config, server_addr).await?;
 
     conn.send(&Request::Exec {
@@ -600,7 +617,11 @@ async fn exec(
     let response: Response = conn.receive().await?;
 
     match response {
-        Response::ExecResult { exit_code, stdout, stderr } => {
+        Response::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
             if !stdout.is_empty() {
                 print!("{}", stdout);
             }
@@ -632,7 +653,11 @@ async fn status(config: &Config, server_addr: &str) -> Result<()> {
     let response: Response = conn.receive().await?;
 
     match response {
-        Response::StatusInfo { uptime_secs, version, started_at } => {
+        Response::StatusInfo {
+            uptime_secs,
+            version,
+            started_at,
+        } => {
             let hours = uptime_secs / 3600;
             let mins = (uptime_secs % 3600) / 60;
             let secs = uptime_secs % 60;

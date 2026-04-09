@@ -272,9 +272,15 @@ mod tests {
         config.save_client(&client).unwrap();
         let loaded = config.load_client().unwrap();
 
-        assert_eq!(loaded.default_server, Some("server.example.com:7433".to_string()));
+        assert_eq!(
+            loaded.default_server,
+            Some("server.example.com:7433".to_string())
+        );
         assert!(loaded.known_servers.contains_key("server.example.com:7433"));
-        assert_eq!(loaded.known_servers["server.example.com:7433"].fingerprint, "abc123def456");
+        assert_eq!(
+            loaded.known_servers["server.example.com:7433"].fingerprint,
+            "abc123def456"
+        );
     }
 
     #[test]
@@ -312,8 +318,14 @@ mod tests {
         let loaded = config.load_client().unwrap();
 
         assert_eq!(loaded.known_servers.len(), 2);
-        assert_eq!(loaded.known_servers["server1.example.com:7433"].fingerprint, "fp1");
-        assert_eq!(loaded.known_servers["server2.example.com:7433"].fingerprint, "fp2");
+        assert_eq!(
+            loaded.known_servers["server1.example.com:7433"].fingerprint,
+            "fp1"
+        );
+        assert_eq!(
+            loaded.known_servers["server2.example.com:7433"].fingerprint,
+            "fp2"
+        );
     }
 
     // Trusted client management tests
@@ -356,14 +368,36 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = Config::with_dir(dir.path().to_path_buf());
 
-        config.add_trusted_client(&Fingerprint("fp1".to_string()), "Client 1").unwrap();
-        config.add_trusted_client(&Fingerprint("fp2".to_string()), "Client 2").unwrap();
-        config.add_trusted_client(&Fingerprint("fp3".to_string()), "Client 3").unwrap();
+        config
+            .add_trusted_client(&Fingerprint("fp1".to_string()), "Client 1")
+            .unwrap();
+        config
+            .add_trusted_client(&Fingerprint("fp2".to_string()), "Client 2")
+            .unwrap();
+        config
+            .add_trusted_client(&Fingerprint("fp3".to_string()), "Client 3")
+            .unwrap();
 
-        assert!(config.is_client_trusted(&Fingerprint("fp1".to_string())).unwrap());
-        assert!(config.is_client_trusted(&Fingerprint("fp2".to_string())).unwrap());
-        assert!(config.is_client_trusted(&Fingerprint("fp3".to_string())).unwrap());
-        assert!(!config.is_client_trusted(&Fingerprint("fp4".to_string())).unwrap());
+        assert!(
+            config
+                .is_client_trusted(&Fingerprint("fp1".to_string()))
+                .unwrap()
+        );
+        assert!(
+            config
+                .is_client_trusted(&Fingerprint("fp2".to_string()))
+                .unwrap()
+        );
+        assert!(
+            config
+                .is_client_trusted(&Fingerprint("fp3".to_string()))
+                .unwrap()
+        );
+        assert!(
+            !config
+                .is_client_trusted(&Fingerprint("fp4".to_string()))
+                .unwrap()
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::claude::ClaudeOutput;
 use serde::{Deserialize, Serialize};
 
 // Re-export wire protocol from tofu-mtls
-pub use tofu_mtls::{read_message, write_message, WireError as ProtocolError, MAX_MESSAGE_SIZE};
+pub use tofu_mtls::{MAX_MESSAGE_SIZE, WireError as ProtocolError, read_message, write_message};
 
 /// Request from client to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
