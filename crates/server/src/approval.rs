@@ -180,61 +180,8 @@ impl ApprovalApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // Header with approval dialog or status
-        let header = if let Some(fingerprint) = &self.current {
-            column![
-                text("New Connection Request").size(36),
-                text(format!("Fingerprint: {}...", &fingerprint.0[..16])).size(24),
-                row![
-                    button(text("Approve").size(24))
-                        .padding(16)
-                        .on_press(Message::Approve),
-                    text("  "),
-                    button(text("Reject").size(24))
-                        .padding(16)
-                        .on_press(Message::Reject),
-                ]
-            ]
-            .spacing(12)
-        } else {
-            column![
-                text("Claude Remote Server").size(36),
-                text(format!("Waiting... ({} pending)", self.pending.len())).size(24),
-            ]
-            .spacing(10)
-        };
-
-        // Activity log
-        let grey = iced::Color::from_rgb(0.5, 0.5, 0.5);
-        let log_entries: Vec<Element<'_, Message>> = self
-            .activity_log
-            .iter()
-            .map(|entry| {
-                let is_grey = entry.prefix == "CONNECT" || entry.prefix == "DISCONNECT";
-                if is_grey {
-                    row![
-                        text(&entry.prefix)
-                            .size(20)
-                            .width(Length::Fixed(140.0))
-                            .color(grey),
-                        text(&entry.content).size(20).color(grey),
-                    ]
-                } else {
-                    row![
-                        text(&entry.prefix).size(20).width(Length::Fixed(140.0)),
-                        text(&entry.content).size(20),
-                    ]
-                }
-                .spacing(12)
-                .into()
-            })
-            .collect();
-
-        let log_content = if log_entries.is_empty() {
-            Column::new().push(text("No activity yet").size(22))
-        } else {
-            Column::with_children(log_entries).spacing(6)
-        };
+        let header = self.header_view();
+        let log_content = self.log_content();
 
         let activity_log = scrollable(log_content)
             .width(Length::Fill)
@@ -255,6 +202,48 @@ impl ApprovalApp {
             .into()
     }
 
+    fn header_view(&self) -> Column<'_, Message> {
+        match &self.current {
+            Some(fingerprint) => self.pending_header(fingerprint),
+            None => self.waiting_header(),
+        }
+    }
+
+    fn pending_header(&self, fingerprint: &Fingerprint) -> Column<'_, Message> {
+        column![
+            text("New Connection Request").size(36),
+            text(format!("Fingerprint: {}...", &fingerprint.0[..16])).size(24),
+            row![
+                button(text("Approve").size(24))
+                    .padding(16)
+                    .on_press(Message::Approve),
+                text("  "),
+                button(text("Reject").size(24))
+                    .padding(16)
+                    .on_press(Message::Reject),
+            ]
+        ]
+        .spacing(12)
+    }
+
+    fn waiting_header(&self) -> Column<'_, Message> {
+        column![
+            text("Claude Remote Server").size(36),
+            text(format!("Waiting... ({} pending)", self.pending.len())).size(24),
+        ]
+        .spacing(10)
+    }
+
+    fn log_content(&self) -> Column<'_, Message> {
+        let rows: Vec<Element<'_, Message>> =
+            self.activity_log.iter().map(log_entry_view).collect();
+
+        if rows.is_empty() {
+            return Column::new().push(text("No activity yet").size(22));
+        }
+        Column::with_children(rows).spacing(6)
+    }
+
     fn subscription(&self) -> iced::Subscription<Message> {
         iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::Tick)
     }
@@ -268,6 +257,21 @@ fn preview_content(text: &str) -> String {
     let preview: String = text.chars().take(60).collect();
     let ellipsis = if text.len() > 60 { "..." } else { "" };
     format!("{}{}", preview, ellipsis)
+}
+
+fn log_entry_view(entry: &LogEntry) -> Element<'_, Message> {
+    let grey = iced::Color::from_rgb(0.5, 0.5, 0.5);
+    let style_grey = entry.prefix == "CONNECT" || entry.prefix == "DISCONNECT";
+    let prefix = text(&entry.prefix).size(20).width(Length::Fixed(140.0));
+    let content = text(&entry.content).size(20);
+
+    if style_grey {
+        return row![prefix.color(grey), content.color(grey)]
+            .spacing(12)
+            .into();
+    }
+
+    row![prefix, content].spacing(12).into()
 }
 
 /// Run the approval GUI

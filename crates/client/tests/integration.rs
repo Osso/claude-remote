@@ -97,48 +97,67 @@ async fn handle_test_requests<S: AsyncRead + AsyncWrite + Unpin>(
 
     tokio::select! {
         _ = async {
-            loop {
-                let request: Request = match wire::read_message(&mut reader).await {
-                    Ok(req) => req,
-                    Err(_) => break,
-                };
-
-                match request {
-                    Request::Ping => {
-                        wire::write_message(&mut writer, &Response::Pong).await?;
-                    }
-                    Request::Status => {
-                        wire::write_message(&mut writer, &Response::StatusInfo {
-                            uptime_secs: 42,
-                            version: "test123".to_string(),
-                            started_at: "1234567890".to_string(),
-                        }).await?;
-                    }
-                    Request::ListSessions => {
-                        wire::write_message(&mut writer, &Response::Sessions {
-                            sessions: vec![],
-                        }).await?;
-                    }
-                    Request::Exec { command, .. } => {
-                        wire::write_message(&mut writer, &Response::ExecResult {
-                            exit_code: Some(0),
-                            stdout: format!("executed: {}", command),
-                            stderr: String::new(),
-                        }).await?;
-                    }
-                    _ => {
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: "Not implemented in test".to_string(),
-                        }).await?;
-                    }
-                }
-            }
-            Ok::<_, anyhow::Error>(())
+            handle_request_loop(&mut reader, &mut writer).await
         } => {}
         _ = stop_rx => {}
     }
 
     Ok(())
+}
+
+async fn handle_request_loop<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let request: Request = match wire::read_message(reader).await {
+            Ok(req) => req,
+            Err(_) => break,
+        };
+        respond_to_request(request, writer).await?;
+    }
+    Ok(())
+}
+
+async fn respond_to_request<W>(request: Request, writer: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match request {
+        Request::Ping => wire::write_message(writer, &Response::Pong).await?,
+        Request::Status => wire::write_message(writer, &status_info_response()).await?,
+        Request::ListSessions => {
+            wire::write_message(writer, &Response::Sessions { sessions: vec![] }).await?
+        }
+        Request::Exec { command, .. } => {
+            wire::write_message(writer, &exec_response(command)).await?
+        }
+        _ => wire::write_message(writer, &not_implemented_response()).await?,
+    }
+    Ok(())
+}
+
+fn status_info_response() -> Response {
+    Response::StatusInfo {
+        uptime_secs: 42,
+        version: "test123".to_string(),
+        started_at: "1234567890".to_string(),
+    }
+}
+
+fn exec_response(command: String) -> Response {
+    Response::ExecResult {
+        exit_code: Some(0),
+        stdout: format!("executed: {}", command),
+        stderr: String::new(),
+    }
+}
+
+fn not_implemented_response() -> Response {
+    Response::Error {
+        message: "Not implemented in test".to_string(),
+    }
 }
 
 /// Create a client config in a temp directory

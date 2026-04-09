@@ -170,28 +170,28 @@ impl Server {
         let server_info = self.server_info.clone();
 
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    // Extract client certificate fingerprint
-                    let fingerprint = extract_client_fingerprint_generic(&tls_stream);
-                    tracing::info!("Client fingerprint: {}", fingerprint);
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::error!("TLS handshake failed: {}", error);
+                    return;
+                }
+            };
 
-                    if let Err(e) = handle_connection(
-                        tls_stream,
-                        fingerprint,
-                        config,
-                        approval_tx,
-                        activity_tx,
-                        server_info,
-                    )
-                    .await
-                    {
-                        tracing::error!("Connection error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("TLS handshake failed: {}", e);
-                }
+            let fingerprint = extract_client_fingerprint_generic(&tls_stream);
+            tracing::info!("Client fingerprint: {}", fingerprint);
+
+            if let Err(error) = handle_connection(
+                tls_stream,
+                fingerprint,
+                config,
+                approval_tx,
+                activity_tx,
+                server_info,
+            )
+            .await
+            {
+                tracing::error!("Connection error: {}", error);
             }
         });
     }
