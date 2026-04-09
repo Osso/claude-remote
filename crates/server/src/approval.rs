@@ -1,7 +1,7 @@
 //! Approval dialog GUI using iced
 
 use claude_remote_common::{Config, Fingerprint};
-use iced::widget::{button, column, container, row, scrollable, text, Column};
+use iced::widget::{Column, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Task, Theme};
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
@@ -20,7 +20,10 @@ pub enum Activity {
     /// Client disconnected
     Disconnected { fingerprint: String },
     /// Prompt received from client
-    Prompt { fingerprint: String, content: String },
+    Prompt {
+        fingerprint: String,
+        content: String,
+    },
     /// Response chunk from Claude
     Response { text: String },
     /// Request completed
@@ -34,9 +37,6 @@ pub enum Activity {
 /// Message type for the approval GUI
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// New approval request received (for future use)
-    #[allow(dead_code)]
-    NewRequest(Fingerprint),
     /// User approved the client
     Approve,
     /// User rejected the client
@@ -98,91 +98,83 @@ impl ApprovalApp {
         }
     }
 
-    #[allow(dead_code)]
-    fn title(&self) -> String {
-        if self.current.is_some() {
-            "Claude Remote - New Connection".to_string()
-        } else {
-            "Claude Remote Server".to_string()
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Approve => self.handle_approve(),
+            Message::Reject => self.handle_reject(),
+            Message::Tick => {
+                self.drain_pending_requests();
+                self.drain_activity_log();
+                Task::none()
+            }
         }
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::NewRequest(fingerprint) => {
-                if self.current.is_none() {
-                    self.current = Some(fingerprint);
-                }
-                Task::none()
+    fn handle_approve(&mut self) -> Task<Message> {
+        if let Some((fingerprint, response)) = self.pending.pop_front() {
+            let name = format!("client-{}", &fingerprint.0[..8]);
+            if let Err(error) = self.config.add_trusted_client(&fingerprint, &name) {
+                tracing::error!("Failed to save trusted client: {}", error);
             }
+            let _ = response.send(true);
+            self.current = self.pending.front().map(|(fp, _)| fp.clone());
+        }
+        Task::none()
+    }
 
-            Message::Approve => {
-                if let Some((fingerprint, response)) = self.pending.pop_front() {
-                    // Save to config
-                    let name = format!("client-{}", &fingerprint.0[..8]);
-                    if let Err(e) = self.config.add_trusted_client(&fingerprint, &name) {
-                        tracing::error!("Failed to save trusted client: {}", e);
-                    }
+    fn handle_reject(&mut self) -> Task<Message> {
+        if let Some((_, response)) = self.pending.pop_front() {
+            let _ = response.send(false);
+            self.current = self.pending.front().map(|(fp, _)| fp.clone());
+        }
+        Task::none()
+    }
 
-                    let _ = response.send(true);
-                    self.current = self.pending.front().map(|(fp, _)| fp.clone());
-                }
-                Task::none()
+    fn drain_pending_requests(&mut self) {
+        while let Ok(request) = self.request_rx.try_recv() {
+            let fingerprint = request.fingerprint.clone();
+            self.pending
+                .push_back((request.fingerprint, request.response));
+            if self.current.is_none() {
+                self.current = Some(fingerprint);
             }
+        }
+    }
 
-            Message::Reject => {
-                if let Some((_, response)) = self.pending.pop_front() {
-                    let _ = response.send(false);
-                    self.current = self.pending.front().map(|(fp, _)| fp.clone());
-                }
-                Task::none()
+    fn drain_activity_log(&mut self) {
+        while let Ok(activity) = self.activity_rx.try_recv() {
+            self.log_activity(activity);
+        }
+    }
+
+    fn log_activity(&mut self, activity: Activity) {
+        match activity {
+            Activity::Connected { fingerprint } => {
+                self.add_log("CONNECT", format!("{}", &fingerprint[..16]));
             }
-
-            Message::Tick => {
-                // Check for new requests (non-blocking)
-                while let Ok(request) = self.request_rx.try_recv() {
-                    let fingerprint = request.fingerprint.clone();
-                    self.pending.push_back((request.fingerprint, request.response));
-                    if self.current.is_none() {
-                        self.current = Some(fingerprint);
-                    }
-                }
-
-                // Check for activity messages
-                while let Ok(activity) = self.activity_rx.try_recv() {
-                    match activity {
-                        Activity::Connected { fingerprint } => {
-                            self.add_log("CONNECT", format!("{}", &fingerprint[..16]));
-                        }
-                        Activity::Disconnected { fingerprint } => {
-                            self.add_log("DISCONNECT", format!("{}", &fingerprint[..16]));
-                        }
-                        Activity::Prompt { fingerprint, content } => {
-                            let preview: String = content.chars().take(60).collect();
-                            let ellipsis = if content.len() > 60 { "..." } else { "" };
-                            self.add_log(
-                                format!("[{}]", &fingerprint[..8]),
-                                format!("{}{}", preview, ellipsis),
-                            );
-                        }
-                        Activity::Response { text } => {
-                            let preview: String = text.chars().take(60).collect();
-                            let ellipsis = if text.len() > 60 { "..." } else { "" };
-                            self.add_log("CLAUDE", format!("{}{}", preview, ellipsis));
-                        }
-                        Activity::Completed => {
-                            self.add_log("---", "completed");
-                        }
-                        Activity::FileGet { fingerprint, path } => {
-                            self.add_log(format!("[{}]", &fingerprint[..8]), format!("GET {}", path));
-                        }
-                        Activity::FilePut { fingerprint, path } => {
-                            self.add_log(format!("[{}]", &fingerprint[..8]), format!("PUT {}", path));
-                        }
-                    }
-                }
-
-                Task::none()
+            Activity::Disconnected { fingerprint } => {
+                self.add_log("DISCONNECT", format!("{}", &fingerprint[..16]));
+            }
+            Activity::Prompt {
+                fingerprint,
+                content,
+            } => {
+                self.add_log(
+                    format!("[{}]", &fingerprint[..8]),
+                    preview_content(&content),
+                );
+            }
+            Activity::Response { text } => {
+                self.add_log("CLAUDE", preview_content(&text));
+            }
+            Activity::Completed => {
+                self.add_log("---", "completed");
+            }
+            Activity::FileGet { fingerprint, path } => {
+                self.add_log(format!("[{}]", &fingerprint[..8]), format!("GET {}", path));
+            }
+            Activity::FilePut { fingerprint, path } => {
+                self.add_log(format!("[{}]", &fingerprint[..8]), format!("PUT {}", path));
             }
         }
     }
@@ -207,11 +199,7 @@ impl ApprovalApp {
         } else {
             column![
                 text("Claude Remote Server").size(36),
-                text(format!(
-                    "Waiting... ({} pending)",
-                    self.pending.len()
-                ))
-                .size(24),
+                text(format!("Waiting... ({} pending)", self.pending.len())).size(24),
             ]
             .spacing(10)
         };
@@ -225,7 +213,10 @@ impl ApprovalApp {
                 let is_grey = entry.prefix == "CONNECT" || entry.prefix == "DISCONNECT";
                 if is_grey {
                     row![
-                        text(&entry.prefix).size(20).width(Length::Fixed(140.0)).color(grey),
+                        text(&entry.prefix)
+                            .size(20)
+                            .width(Length::Fixed(140.0))
+                            .color(grey),
                         text(&entry.content).size(20).color(grey),
                     ]
                 } else {
@@ -273,17 +264,27 @@ impl ApprovalApp {
     }
 }
 
+fn preview_content(text: &str) -> String {
+    let preview: String = text.chars().take(60).collect();
+    let ellipsis = if text.len() > 60 { "..." } else { "" };
+    format!("{}{}", preview, ellipsis)
+}
+
 /// Run the approval GUI
 pub fn run_gui(
     request_rx: mpsc::Receiver<ApprovalRequest>,
     activity_rx: mpsc::Receiver<Activity>,
     config: Config,
 ) -> anyhow::Result<()> {
-    iced::application("Claude Remote Server", ApprovalApp::update, ApprovalApp::view)
-        .subscription(ApprovalApp::subscription)
-        .theme(ApprovalApp::theme)
-        .window_size((800.0, 600.0))
-        .run_with(move || ApprovalApp::new(request_rx, activity_rx, config))?;
+    iced::application(
+        "Claude Remote Server",
+        ApprovalApp::update,
+        ApprovalApp::view,
+    )
+    .subscription(ApprovalApp::subscription)
+    .theme(ApprovalApp::theme)
+    .window_size((800.0, 600.0))
+    .run_with(move || ApprovalApp::new(request_rx, activity_rx, config))?;
 
     Ok(())
 }

@@ -2,21 +2,21 @@
 
 use anyhow::{Context, Result};
 use claude_remote_common::{CertManager, Config, Fingerprint};
-use claude_remote_protocol::{wire, Request, Response};
+use claude_remote_protocol::{Request, Response, wire};
 use std::sync::Arc;
-use tokio::io::{split, AsyncRead, AsyncWrite};
+use tofu_mtls::AcceptAnyClientCert;
+use tokio::io::{AsyncRead, AsyncWrite, split};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
-use tofu_mtls::AcceptAnyClientCert;
+use tokio_rustls::server::TlsStream;
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+use crate::ServerInfo;
 use crate::approval::{Activity, ApprovalRequest};
 use crate::claude_process::ClaudeProcess;
-use crate::ServerInfo;
 
 /// Listener that can be either TCP or Unix socket
 pub enum Listener {
@@ -37,18 +37,22 @@ impl Listener {
     pub async fn bind_unix(path: &str) -> Result<Self> {
         // Remove existing socket file if it exists
         let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)
-            .context(format!("Failed to bind to Unix socket {}", path))?;
+        let listener =
+            UnixListener::bind(path).context(format!("Failed to bind to Unix socket {}", path))?;
         Ok(Listener::Unix(listener))
     }
 
-    #[allow(dead_code)]
-    pub fn local_addr_string(&self) -> String {
+    pub fn _local_addr_string(&self) -> String {
         match self {
             Listener::Tcp(l) => l.local_addr().map(|a| a.to_string()).unwrap_or_default(),
             #[cfg(unix)]
-            Listener::Unix(l) => l.local_addr()
-                .map(|a| a.as_pathname().map(|p| p.display().to_string()).unwrap_or_default())
+            Listener::Unix(l) => l
+                .local_addr()
+                .map(|a| {
+                    a.as_pathname()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default(),
         }
     }
@@ -172,8 +176,15 @@ impl Server {
                     let fingerprint = extract_client_fingerprint_generic(&tls_stream);
                     tracing::info!("Client fingerprint: {}", fingerprint);
 
-                    if let Err(e) =
-                        handle_connection(tls_stream, fingerprint, config, approval_tx, activity_tx, server_info).await
+                    if let Err(e) = handle_connection(
+                        tls_stream,
+                        fingerprint,
+                        config,
+                        approval_tx,
+                        activity_tx,
+                        server_info,
+                    )
+                    .await
                     {
                         tracing::error!("Connection error: {}", e);
                     }
@@ -285,7 +296,10 @@ where
         };
 
         match request {
-            Request::Prompt { content, session_id } => {
+            Request::Prompt {
+                content,
+                session_id,
+            } => {
                 tracing::info!("Received prompt: {}...", &content[..content.len().min(50)]);
 
                 // Log the prompt
@@ -348,11 +362,15 @@ where
             }
 
             Request::Status => {
-                wire::write_message(&mut writer, &Response::StatusInfo {
-                    uptime_secs: server_info.uptime_secs(),
-                    version: server_info.version.clone(),
-                    started_at: server_info.started_at_iso(),
-                }).await?;
+                wire::write_message(
+                    &mut writer,
+                    &Response::StatusInfo {
+                        uptime_secs: server_info.uptime_secs(),
+                        version: server_info.version.clone(),
+                        started_at: server_info.started_at_iso(),
+                    },
+                )
+                .await?;
             }
 
             Request::ListSessions => {
@@ -381,7 +399,13 @@ where
                     writer: &mut W,
                     msg: &str,
                 ) -> anyhow::Result<()> {
-                    wire::write_message(writer, &Response::UpdateProgress { message: msg.to_string() }).await?;
+                    wire::write_message(
+                        writer,
+                        &Response::UpdateProgress {
+                            message: msg.to_string(),
+                        },
+                    )
+                    .await?;
                     Ok(())
                 }
 
@@ -400,15 +424,23 @@ where
                     }
                     Ok(output) => {
                         let err = String::from_utf8_lossy(&output.stderr);
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: format!("Git pull failed: {}", err),
-                        }).await?;
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Git pull failed: {}", err),
+                            },
+                        )
+                        .await?;
                         continue;
                     }
                     Err(e) => {
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: format!("Failed to run git: {}", e),
-                        }).await?;
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to run git: {}", e),
+                            },
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -427,30 +459,43 @@ where
                     }
                     Ok(output) => {
                         let err = String::from_utf8_lossy(&output.stderr);
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: format!("Build failed: {}", err),
-                        }).await?;
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Build failed: {}", err),
+                            },
+                        )
+                        .await?;
                         continue;
                     }
                     Err(e) => {
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: format!("Failed to run cargo: {}", e),
-                        }).await?;
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Failed to run cargo: {}", e),
+                            },
+                        )
+                        .await?;
                         continue;
                     }
                 }
 
                 // Determine new binary path
                 #[cfg(windows)]
-                let new_binary = format!("{}\\target\\release\\claude-remote-server.exe", project_dir);
+                let new_binary =
+                    format!("{}\\target\\release\\claude-remote-server.exe", project_dir);
                 #[cfg(not(windows))]
                 let new_binary = format!("{}/target/release/claude-remote-server", project_dir);
 
                 // Verify binary exists before attempting restart
                 if !std::path::Path::new(&new_binary).exists() {
-                    wire::write_message(&mut writer, &Response::Error {
-                        message: format!("Binary not found: {}", new_binary),
-                    }).await?;
+                    wire::write_message(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("Binary not found: {}", new_binary),
+                        },
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -477,9 +522,13 @@ where
                 // Give new server time to start
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                wire::write_message(&mut writer, &Response::UpdateComplete {
-                    new_binary: new_binary.clone(),
-                }).await?;
+                wire::write_message(
+                    &mut writer,
+                    &Response::UpdateComplete {
+                        new_binary: new_binary.clone(),
+                    },
+                )
+                .await?;
 
                 tracing::info!("Update complete, shutting down old server");
                 // Exit after a brief delay to let response be sent
@@ -515,47 +564,53 @@ where
 
                 match result {
                     Ok(output) => {
-                        wire::write_message(&mut writer, &Response::ExecResult {
-                            exit_code: output.status.code(),
-                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        }).await?;
-                    }
-                    Err(e) => {
-                        wire::write_message(&mut writer, &Response::Error {
-                            message: format!("Failed to execute command: {}", e),
-                        }).await?;
-                    }
-                }
-            }
-
-            Request::StatFile { path } => {
-                match tokio::fs::metadata(&path).await {
-                    Ok(meta) => {
-                        if meta.is_dir() {
-                            wire::write_message(
-                                &mut writer,
-                                &Response::Error {
-                                    message: format!("Path is a directory, not a file: {}", path),
-                                },
-                            )
-                            .await?;
-                        } else {
-                            wire::write_message(&mut writer, &Response::FileStat { size: meta.len() })
-                                .await?;
-                        }
+                        wire::write_message(
+                            &mut writer,
+                            &Response::ExecResult {
+                                exit_code: output.status.code(),
+                                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                            },
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         wire::write_message(
                             &mut writer,
                             &Response::Error {
-                                message: format!("Failed to stat file: {}", e),
+                                message: format!("Failed to execute command: {}", e),
                             },
                         )
                         .await?;
                     }
                 }
             }
+
+            Request::StatFile { path } => match tokio::fs::metadata(&path).await {
+                Ok(meta) => {
+                    if meta.is_dir() {
+                        wire::write_message(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("Path is a directory, not a file: {}", path),
+                            },
+                        )
+                        .await?;
+                    } else {
+                        wire::write_message(&mut writer, &Response::FileStat { size: meta.len() })
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    wire::write_message(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("Failed to stat file: {}", e),
+                        },
+                    )
+                    .await?;
+                }
+            },
 
             Request::GetFile { path } => {
                 use base64::Engine;
@@ -595,8 +650,11 @@ where
                 match tokio::fs::read(&path).await {
                     Ok(content) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
-                        wire::write_message(&mut writer, &Response::FileContent { content: encoded })
-                            .await?;
+                        wire::write_message(
+                            &mut writer,
+                            &Response::FileContent { content: encoded },
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         wire::write_message(
@@ -610,7 +668,11 @@ where
                 }
             }
 
-            Request::GetFileChunk { path, offset, length } => {
+            Request::GetFileChunk {
+                path,
+                offset,
+                length,
+            } => {
                 use base64::Engine;
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -655,9 +717,13 @@ where
                         let mut buffer = vec![0u8; length as usize];
                         match file.read_exact(&mut buffer).await {
                             Ok(_) => {
-                                let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
-                                wire::write_message(&mut writer, &Response::FileChunk { content: encoded })
-                                    .await?;
+                                let encoded =
+                                    base64::engine::general_purpose::STANDARD.encode(&buffer);
+                                wire::write_message(
+                                    &mut writer,
+                                    &Response::FileChunk { content: encoded },
+                                )
+                                .await?;
                             }
                             Err(e) => {
                                 // Try reading what's available (for last chunk)
@@ -666,9 +732,13 @@ where
                                     match file.read(&mut buffer).await {
                                         Ok(n) => {
                                             buffer.truncate(n);
-                                            let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
-                                            wire::write_message(&mut writer, &Response::FileChunk { content: encoded })
-                                                .await?;
+                                            let encoded = base64::engine::general_purpose::STANDARD
+                                                .encode(&buffer);
+                                            wire::write_message(
+                                                &mut writer,
+                                                &Response::FileChunk { content: encoded },
+                                            )
+                                            .await?;
                                         }
                                         Err(e) => {
                                             wire::write_message(
@@ -741,7 +811,12 @@ where
                 }
             }
 
-            Request::PutFileChunk { path, offset, total_size, content } => {
+            Request::PutFileChunk {
+                path,
+                offset,
+                total_size,
+                content,
+            } => {
                 use base64::Engine;
                 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -751,16 +826,15 @@ where
                         let file_result = if offset == 0 {
                             tokio::fs::File::create(&path).await
                         } else {
-                            tokio::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&path)
-                                .await
+                            tokio::fs::OpenOptions::new().write(true).open(&path).await
                         };
 
                         match file_result {
                             Ok(mut file) => {
                                 if offset > 0 {
-                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                                    if let Err(e) =
+                                        file.seek(std::io::SeekFrom::Start(offset)).await
+                                    {
                                         wire::write_message(
                                             &mut writer,
                                             &Response::Error {

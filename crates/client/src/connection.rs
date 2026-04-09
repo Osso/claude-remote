@@ -4,15 +4,15 @@ use anyhow::{Context, Result};
 use claude_remote_common::{CertManager, Config, Fingerprint};
 use claude_remote_protocol::wire;
 use rustls::pki_types::ServerName;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use tofu_mtls::{AcceptAnyServerCert, KnownHosts, TofuVerification};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tofu_mtls::{AcceptAnyServerCert, KnownHosts, TofuVerification};
+use tokio_rustls::client::TlsStream;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -49,10 +49,7 @@ impl Connection {
                 tracing::info!("Connected to known server");
             }
             ServerVerification::NewServer { fingerprint } => {
-                tracing::warn!(
-                    "Connected to new server. Fingerprint: {}",
-                    fingerprint
-                );
+                tracing::warn!("Connected to new server. Fingerprint: {}", fingerprint);
                 tracing::warn!("The server fingerprint has been saved for future connections.");
             }
             ServerVerification::FingerprintMismatch { expected, actual } => {
@@ -62,7 +59,8 @@ impl Connection {
                      Actual:   {}\n\
                      This could indicate a man-in-the-middle attack.\n\
                      If you trust this server, delete the entry from your config.",
-                    expected, actual
+                    expected,
+                    actual
                 ));
             }
         }
@@ -230,14 +228,7 @@ fn parse_address(addr: &str) -> Result<(&str, u16)> {
 /// Extract server certificate fingerprint from TLS stream over TCP
 fn extract_server_fingerprint(stream: &TlsStream<TcpStream>) -> Fingerprint {
     let (_, client_conn) = stream.get_ref();
-
-    if let Some(certs) = client_conn.peer_certificates() {
-        if let Some(cert) = certs.first() {
-            return Fingerprint::from_rustls_cert(cert);
-        }
-    }
-
-    Fingerprint("no-certificate".to_string())
+    fingerprint_from_peer_certs(client_conn.peer_certificates())
 }
 
 /// Extract server certificate fingerprint from TLS stream (generic)
@@ -247,14 +238,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (_, client_conn) = stream.get_ref();
+    fingerprint_from_peer_certs(client_conn.peer_certificates())
+}
 
-    if let Some(certs) = client_conn.peer_certificates() {
-        if let Some(cert) = certs.first() {
-            return Fingerprint::from_rustls_cert(cert);
-        }
-    }
-
-    Fingerprint("no-certificate".to_string())
+fn fingerprint_from_peer_certs(
+    certs: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+) -> Fingerprint {
+    certs
+        .and_then(|certs| certs.first())
+        .map(Fingerprint::from_rustls_cert)
+        .unwrap_or_else(|| Fingerprint("no-certificate".to_string()))
 }
 
 /// Verify server fingerprint using TOFU model
@@ -375,10 +368,13 @@ mod tests {
 
         // Pre-save a known server
         let fingerprint = Fingerprint("expected_fp".to_string());
-        known_hosts.add("knownserver.com:7433", &fingerprint).unwrap();
+        known_hosts
+            .add("knownserver.com:7433", &fingerprint)
+            .unwrap();
 
         // Verify with matching fingerprint
-        let result = verify_server(&known_hosts_path, "knownserver.com:7433", &fingerprint).unwrap();
+        let result =
+            verify_server(&known_hosts_path, "knownserver.com:7433", &fingerprint).unwrap();
 
         assert!(matches!(result, ServerVerification::Known));
     }
@@ -390,11 +386,17 @@ mod tests {
         let known_hosts = KnownHosts::new(&known_hosts_path);
 
         // Pre-save a known server
-        known_hosts.add("knownserver.com:7433", &Fingerprint("expected_fp".to_string())).unwrap();
+        known_hosts
+            .add(
+                "knownserver.com:7433",
+                &Fingerprint("expected_fp".to_string()),
+            )
+            .unwrap();
 
         // Verify with different fingerprint
         let fingerprint = Fingerprint("different_fp".to_string());
-        let result = verify_server(&known_hosts_path, "knownserver.com:7433", &fingerprint).unwrap();
+        let result =
+            verify_server(&known_hosts_path, "knownserver.com:7433", &fingerprint).unwrap();
 
         match result {
             ServerVerification::FingerprintMismatch { expected, actual } => {

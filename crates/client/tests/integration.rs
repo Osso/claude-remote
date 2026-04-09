@@ -18,19 +18,18 @@ use claude_remote_protocol::wire;
 use claude_remote_protocol::{Request, Response};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::io::{split, AsyncRead, AsyncWrite};
+use tofu_mtls::AcceptAnyClientCert;
+use tokio::io::{AsyncRead, AsyncWrite, split};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
-use tofu_mtls::AcceptAnyClientCert;
 
 /// Test server that auto-approves all clients
 struct TestServer {
     port: u16,
     acceptor: TlsAcceptor,
     listener: TcpListener,
-    #[allow(dead_code)]
-    config_dir: TempDir,
+    _config_dir: TempDir,
 }
 
 impl TestServer {
@@ -43,8 +42,8 @@ impl TestServer {
         let (cert_pem, key_pem) = cert_mgr.load_or_generate("test-server")?;
 
         // Parse certificate and key
-        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()?;
+        let certs =
+            rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<Vec<_>, _>>()?;
 
         let key = rustls_pemfile::private_key(&mut key_pem.as_slice())?
             .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
@@ -65,7 +64,7 @@ impl TestServer {
             port,
             acceptor,
             listener,
-            config_dir,
+            _config_dir: config_dir,
         })
     }
 
@@ -162,11 +161,13 @@ mod connection_tests {
         // Server task
         let server_handle = tokio::spawn(async move {
             let (stop_tx, stop_rx) = oneshot::channel();
-            server.accept_one(|stream| async move {
-                // Just accept and immediately close
-                drop(stop_tx);
-                handle_test_requests(stream, stop_rx).await
-            }).await
+            server
+                .accept_one(|stream| async move {
+                    // Just accept and immediately close
+                    drop(stop_tx);
+                    handle_test_requests(stream, stop_rx).await
+                })
+                .await
         });
 
         // Give server time to start
@@ -193,9 +194,9 @@ mod connection_tests {
 
         // Server task
         let server_handle = tokio::spawn(async move {
-            server.accept_one(|stream| async move {
-                handle_test_requests(stream, stop_rx).await
-            }).await
+            server
+                .accept_one(|stream| async move { handle_test_requests(stream, stop_rx).await })
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -224,9 +225,9 @@ mod connection_tests {
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let server_handle = tokio::spawn(async move {
-            server.accept_one(|stream| async move {
-                handle_test_requests(stream, stop_rx).await
-            }).await
+            server
+                .accept_one(|stream| async move { handle_test_requests(stream, stop_rx).await })
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -238,7 +239,11 @@ mod connection_tests {
 
         let response: Response = conn.receive().await.unwrap();
         match response {
-            Response::StatusInfo { uptime_secs, version, .. } => {
+            Response::StatusInfo {
+                uptime_secs,
+                version,
+                ..
+            } => {
                 assert_eq!(uptime_secs, 42);
                 assert_eq!(version, "test123");
             }
@@ -258,9 +263,9 @@ mod connection_tests {
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let server_handle = tokio::spawn(async move {
-            server.accept_one(|stream| async move {
-                handle_test_requests(stream, stop_rx).await
-            }).await
+            server
+                .accept_one(|stream| async move { handle_test_requests(stream, stop_rx).await })
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -271,11 +276,15 @@ mod connection_tests {
         conn.send(&Request::Exec {
             command: "echo hello".to_string(),
             cwd: None,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let response: Response = conn.receive().await.unwrap();
         match response {
-            Response::ExecResult { exit_code, stdout, .. } => {
+            Response::ExecResult {
+                exit_code, stdout, ..
+            } => {
                 assert_eq!(exit_code, Some(0));
                 assert!(stdout.contains("echo hello"));
             }
@@ -295,9 +304,9 @@ mod connection_tests {
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let server_handle = tokio::spawn(async move {
-            server.accept_one(|stream| async move {
-                handle_test_requests(stream, stop_rx).await
-            }).await
+            server
+                .accept_one(|stream| async move { handle_test_requests(stream, stop_rx).await })
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -337,7 +346,9 @@ mod connection_tests {
 
                 // Handle one ping
                 let _: Request = wire::read_message(&mut reader1).await.unwrap();
-                wire::write_message(&mut writer1, &Response::Pong).await.unwrap();
+                wire::write_message(&mut writer1, &Response::Pong)
+                    .await
+                    .unwrap();
                 drop(reader1);
                 drop(writer1);
 
@@ -348,7 +359,9 @@ mod connection_tests {
 
                 // Handle one ping
                 let _: Request = wire::read_message(&mut reader2).await.unwrap();
-                wire::write_message(&mut writer2, &Response::Pong).await.unwrap();
+                wire::write_message(&mut writer2, &Response::Pong)
+                    .await
+                    .unwrap();
 
                 Ok::<_, anyhow::Error>(())
             }

@@ -68,7 +68,10 @@ impl ServerInfo {
 
     pub fn started_at_iso(&self) -> String {
         use std::time::UNIX_EPOCH;
-        let duration = self.started_at.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let duration = self
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         // Return Unix timestamp as string (simple, no external deps)
         format!("{}", duration.as_secs())
     }
@@ -97,60 +100,90 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install rustls crypto provider
+    install_rustls_provider();
+    init_logging()?;
+    let args = Args::parse();
+    let config = load_config(&args);
+    tracing::info!("Config directory: {:?}", config.config_dir());
+    let server_info = Arc::new(ServerInfo::new());
+    tracing::info!("Server version: {}", server_info.version);
+    let (approval_tx, approval_rx) = mpsc::channel::<approval::ApprovalRequest>(16);
+    let (activity_tx, activity_rx) = mpsc::channel::<approval::Activity>(256);
+    let server = create_server(&args, &config, approval_tx, activity_tx, server_info).await?;
+    let server = Arc::new(server);
+    spawn_server_loop(server.clone());
+    approval::run_gui(approval_rx, activity_rx, config)?;
+    Ok(())
+}
+
+fn install_rustls_provider() {
     default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
+}
 
-    // Initialize logging
+fn init_logging() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
+    Ok(())
+}
 
-    let args = Args::parse();
-
-    let config = match &args.config_dir {
+fn load_config(args: &Args) -> Config {
+    match &args.config_dir {
         Some(dir) => Config::with_dir(dir.into()),
         None => Config::new(),
-    };
+    }
+}
 
-    tracing::info!("Config directory: {:?}", config.config_dir());
+async fn create_server(
+    args: &Args,
+    config: &Config,
+    approval_tx: mpsc::Sender<approval::ApprovalRequest>,
+    activity_tx: mpsc::Sender<approval::Activity>,
+    server_info: Arc<ServerInfo>,
+) -> Result<tls::Server> {
+    if let Some(socket_path) = &args.socket {
+        return create_server_unix(config, socket_path, approval_tx, activity_tx, server_info)
+            .await;
+    }
+    tls::Server::new(
+        config,
+        &args.address,
+        args.port,
+        approval_tx,
+        activity_tx,
+        server_info,
+    )
+    .await
+}
 
-    // Initialize server info (version hash, start time)
-    let server_info = Arc::new(ServerInfo::new());
-    tracing::info!("Server version: {}", server_info.version);
+#[cfg(unix)]
+async fn create_server_unix(
+    config: &Config,
+    socket_path: &str,
+    approval_tx: mpsc::Sender<approval::ApprovalRequest>,
+    activity_tx: mpsc::Sender<approval::Activity>,
+    server_info: Arc<ServerInfo>,
+) -> Result<tls::Server> {
+    tls::Server::new_unix(config, socket_path, approval_tx, activity_tx, server_info).await
+}
 
-    // Channel for approval requests from connection handlers to GUI
-    let (approval_tx, approval_rx) = mpsc::channel::<approval::ApprovalRequest>(16);
+#[cfg(not(unix))]
+async fn create_server_unix(
+    _config: &Config,
+    _socket_path: &str,
+    _approval_tx: mpsc::Sender<approval::ApprovalRequest>,
+    _activity_tx: mpsc::Sender<approval::Activity>,
+    _server_info: Arc<ServerInfo>,
+) -> Result<tls::Server> {
+    anyhow::bail!("Unix sockets are not supported on this platform");
+}
 
-    // Channel for activity messages from connection handlers to GUI
-    let (activity_tx, activity_rx) = mpsc::channel::<approval::Activity>(256);
-
-    // Start TLS server
-    let server = if let Some(socket_path) = &args.socket {
-        #[cfg(unix)]
-        {
-            tls::Server::new_unix(&config, socket_path, approval_tx, activity_tx, server_info).await?
-        }
-        #[cfg(not(unix))]
-        {
-            anyhow::bail!("Unix sockets are not supported on this platform");
-        }
-    } else {
-        tls::Server::new(&config, &args.address, args.port, approval_tx, activity_tx, server_info).await?
-    };
-    let server = Arc::new(server);
-
-    // Spawn server accept loop
-    let server_clone = server.clone();
+fn spawn_server_loop(server: Arc<tls::Server>) {
     tokio::spawn(async move {
-        if let Err(e) = server_clone.run().await {
-            tracing::error!("Server error: {}", e);
+        if let Err(error) = server.run().await {
+            tracing::error!("Server error: {}", error);
         }
     });
-
-    // Run GUI for approval dialogs (blocks main thread)
-    approval::run_gui(approval_rx, activity_rx, config)?;
-
-    Ok(())
 }
