@@ -55,4 +55,4 @@ tofu-mtls = { git = "https://github.com/Osso/tofu-mtls" }
 
 [profile.release]
 lto = false
-incremental = true
+

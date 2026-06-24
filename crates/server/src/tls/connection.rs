@@ -109,98 +109,158 @@ where
     let mut active_process: Option<ClaudeProcess> = None;
 
     loop {
-        let request: Request = match wire::read_message(reader).await {
-            Ok(req) => req,
-            Err(claude_remote_protocol::wire::ProtocolError::ConnectionClosed) => {
-                tracing::info!("Client disconnected");
-                break;
-            }
-            Err(claude_remote_protocol::wire::ProtocolError::Io(e))
-                if e.kind() == std::io::ErrorKind::ConnectionReset =>
-            {
-                tracing::info!("Client disconnected (reset)");
-                break;
-            }
-            Err(e) => {
-                tracing::error!("Protocol error: {}", e);
-                break;
-            }
+        let Some(request) = read_request(reader).await else {
+            break;
         };
-
-        match request {
-            Request::Prompt {
-                content,
-                session_id,
-            } => {
-                handle_prompt(writer, ctx, &content, session_id, &mut active_process).await?;
-            }
-            Request::Abort => {
-                if let Some(process) = active_process.take() {
-                    process.abort().await;
-                }
-            }
-            Request::Ping => {
-                wire::write_message(writer, &Response::Pong).await?;
-            }
-            Request::Status => {
-                wire::write_message(
-                    writer,
-                    &Response::StatusInfo {
-                        uptime_secs: ctx.server_info.uptime_secs(),
-                        version: ctx.server_info.version.clone(),
-                        started_at: ctx.server_info.started_at_iso(),
-                    },
-                )
-                .await?;
-            }
-            Request::ListSessions => {
-                wire::write_message(
-                    writer,
-                    &Response::Sessions {
-                        sessions: Vec::new(),
-                    },
-                )
-                .await?;
-            }
-            Request::Shutdown => {
-                tracing::info!("Shutdown requested by client");
-                wire::write_message(writer, &Response::ShuttingDown).await?;
-                std::process::exit(0);
-            }
-            Request::Update { project_dir } => {
-                handle_update(writer, &project_dir).await?;
-            }
-            Request::Exec { command, cwd } => {
-                handle_exec(writer, &command, cwd.as_deref()).await?;
-            }
-            Request::StatFile { path } => {
-                handle_stat_file(writer, &path).await?;
-            }
-            Request::GetFile { path } => {
-                handle_get_file(writer, ctx, &path).await?;
-            }
-            Request::GetFileChunk {
-                path,
-                offset,
-                length,
-            } => {
-                handle_get_file_chunk(writer, &path, offset, length).await?;
-            }
-            Request::PutFile { path, content } => {
-                handle_put_file(writer, ctx, &path, &content).await?;
-            }
-            Request::PutFileChunk {
-                path,
-                offset,
-                total_size: _,
-                content,
-            } => {
-                handle_put_file_chunk(writer, &path, offset, &content).await?;
-            }
+        if handle_request(request, writer, ctx, &mut active_process).await? == LoopControl::Exit {
+            break;
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum LoopControl {
+    Continue,
+    Exit,
+}
+
+async fn read_request<R: AsyncRead + Unpin>(reader: &mut R) -> Option<Request> {
+    match wire::read_message(reader).await {
+        Ok(req) => Some(req),
+        Err(claude_remote_protocol::wire::ProtocolError::ConnectionClosed) => {
+            tracing::info!("Client disconnected");
+            None
+        }
+        Err(claude_remote_protocol::wire::ProtocolError::Io(e))
+            if e.kind() == std::io::ErrorKind::ConnectionReset =>
+        {
+            tracing::info!("Client disconnected (reset)");
+            None
+        }
+        Err(e) => {
+            tracing::error!("Protocol error: {}", e);
+            None
+        }
+    }
+}
+
+async fn handle_request<W: AsyncWrite + Unpin>(
+    request: Request,
+    writer: &mut W,
+    ctx: &ConnectionCtx,
+    active_process: &mut Option<ClaudeProcess>,
+) -> Result<LoopControl> {
+    match request {
+        Request::Prompt {
+            content,
+            session_id,
+        } => {
+            handle_prompt(writer, ctx, &content, session_id, active_process).await?;
+            Ok(LoopControl::Continue)
+        }
+        Request::Abort
+        | Request::Ping
+        | Request::Status
+        | Request::ListSessions
+        | Request::Shutdown => handle_control_request(request, writer, ctx, active_process).await,
+        _ => handle_management_request(request, writer, ctx).await,
+    }
+}
+
+async fn abort_active_process(active_process: &mut Option<ClaudeProcess>) {
+    if let Some(process) = active_process.take() {
+        process.abort().await;
+    }
+}
+
+fn status_response(ctx: &ConnectionCtx) -> Response {
+    Response::StatusInfo {
+        uptime_secs: ctx.server_info.uptime_secs(),
+        version: ctx.server_info.version.clone(),
+        started_at: ctx.server_info.started_at_iso(),
+    }
+}
+
+async fn handle_control_request<W: AsyncWrite + Unpin>(
+    request: Request,
+    writer: &mut W,
+    ctx: &ConnectionCtx,
+    active_process: &mut Option<ClaudeProcess>,
+) -> Result<LoopControl> {
+    match request {
+        Request::Abort => {
+            abort_active_process(active_process).await;
+            Ok(LoopControl::Continue)
+        }
+        Request::Ping => write_continue(writer, &Response::Pong).await,
+        Request::Status => write_continue(writer, &status_response(ctx)).await,
+        Request::ListSessions => {
+            write_continue(
+                writer,
+                &Response::Sessions {
+                    sessions: Vec::new(),
+                },
+            )
+            .await
+        }
+        Request::Shutdown => {
+            tracing::info!("Shutdown requested by client");
+            wire::write_message(writer, &Response::ShuttingDown).await?;
+            std::process::exit(0);
+        }
+        _ => unreachable!("control handler received non-control request"),
+    }
+}
+
+async fn handle_management_request<W: AsyncWrite + Unpin>(
+    request: Request,
+    writer: &mut W,
+    ctx: &ConnectionCtx,
+) -> Result<LoopControl> {
+    match request {
+        Request::Update { project_dir } => {
+            handle_update(writer, &project_dir).await?;
+        }
+        Request::Exec { command, cwd } => {
+            handle_exec(writer, &command, cwd.as_deref()).await?;
+        }
+        Request::StatFile { path } => {
+            handle_stat_file(writer, &path).await?;
+        }
+        Request::GetFile { path } => {
+            handle_get_file(writer, ctx, &path).await?;
+        }
+        Request::GetFileChunk {
+            path,
+            offset,
+            length,
+        } => {
+            handle_get_file_chunk(writer, &path, offset, length).await?;
+        }
+        Request::PutFile { path, content } => {
+            handle_put_file(writer, ctx, &path, &content).await?;
+        }
+        Request::PutFileChunk {
+            path,
+            offset,
+            total_size: _,
+            content,
+        } => {
+            handle_put_file_chunk(writer, &path, offset, &content).await?;
+        }
+        _ => unreachable!("management handler received non-management request"),
+    }
+    Ok(LoopControl::Continue)
+}
+
+async fn write_continue<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &Response,
+) -> Result<LoopControl> {
+    wire::write_message(writer, response).await?;
+    Ok(LoopControl::Continue)
 }
 
 // ---------------------------------------------------------------------------
